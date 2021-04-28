@@ -1,9 +1,10 @@
-use crate::gas::{Gas, GasRules};
+use crate::gas_rules::GasRules;
 use crate::module::{ExperimentalFeatures, WasmInstance};
 use futures::sync::mpsc;
 use futures03::channel::oneshot::Sender;
 use graph::components::subgraph::{MappingError, SharedProofOfIndexing};
 use graph::prelude::*;
+use graph::runtime::gas::Gas;
 use graph_chain_ethereum::MappingTrigger;
 use std::collections::BTreeMap;
 use std::sync::Arc;
