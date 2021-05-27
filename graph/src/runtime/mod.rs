@@ -14,6 +14,18 @@ use std::convert::TryInto;
 use std::fmt;
 use std::mem::size_of;
 
+/// Marker trait for AssemblyScript types that the id should
+/// be in the header.
+pub trait AscIndexId {
+    /// Constant string with the name of the type in AssemblyScript.
+    /// This is used to get the identifier for the type in memory layout.
+    /// Info about memory layout:
+    /// https://www.assemblyscript.org/memory.html#common-header-layout.
+    /// Info about identifier (`idof<T>`):
+    /// https://www.assemblyscript.org/garbage-collection.html#runtime-interface
+    const INDEX_ASC_TYPE_ID: Option<IndexForAscTypeId> = None;
+}
+
 /// A type that has a direct correspondence to an Asc type.
 ///
 /// This can be derived for structs that are `#[repr(C)]`, contain no padding
@@ -23,14 +35,6 @@ use std::mem::size_of;
 ///
 /// See https://github.com/graphprotocol/graph-node/issues/607 for more considerations.
 pub trait AscType: Sized {
-    /// Constant string with the name of the type in AssemblyScript.
-    /// This is used to get the identifier for the type in memory layout.
-    /// Info about memory layout:
-    /// https://www.assemblyscript.org/memory.html#common-header-layout.
-    /// Info about identifier (`idof<T>`):
-    /// https://www.assemblyscript.org/garbage-collection.html#runtime-interface
-    const INDEX_ASC_TYPE_ID: Option<IndexForAscTypeId> = None;
-
     /// Transform the Rust representation of this instance into an sequence of
     /// bytes that is precisely the memory layout of a corresponding Asc instance.
     fn to_asc_bytes(&self) -> Result<Vec<u8>, DeterministicHostError>;
@@ -39,15 +43,23 @@ pub trait AscType: Sized {
     fn from_asc_bytes(asc_obj: &[u8]) -> Result<Self, DeterministicHostError>;
 
     /// Size of the corresponding Asc instance in bytes.
-    fn asc_size<H: AscHeap>(ptr: AscPtr<Self>, heap: &H) -> Result<u32, DeterministicHostError> {
+    fn asc_size<H: AscHeap>(ptr: AscPtr<Self>, heap: &H) -> Result<u32, DeterministicHostError>
+    where
+        Self: AscIndexId,
+    {
         // If its a class with the common header
         if Self::INDEX_ASC_TYPE_ID.is_some() {
+            println!("ptr.wasm_ptr: {}", ptr.wasm_ptr());
             let header = heap.get(ptr.wasm_ptr() - 20, 20)?;
             let rt_size = header.get(16..20).unwrap(); // safe unwrap because line above already errors on out of bounds access
             Ok(u32::from_le_bytes(rt_size.try_into().unwrap())) // safe unwrap because line above already gets a 4 sized u8 array
         } else {
             Ok(std::mem::size_of::<Self>() as u32)
         }
+    }
+
+    fn content_len(&self, asc_bytes: &[u8]) -> usize {
+        asc_bytes.len()
     }
 }
 
@@ -119,35 +131,64 @@ macro_rules! impl_asc_type {
 
 impl_asc_type!(u8, u16, u32, u64, i8, i32, i64, f32, f64);
 
+// The numbers on each variant could just be comments hence the
+// `#[repr(u32)]`, however having them in code enforces each value
+// to be the same as the docs.
 #[repr(u32)]
 #[derive(Copy, Clone, Debug)]
 pub enum IndexForAscTypeId {
-    String,
-}
-
-impl AscType for IndexForAscTypeId {
-    fn to_asc_bytes(&self) -> Result<Vec<u8>, DeterministicHostError> {
-        (*self as u32).to_asc_bytes()
-    }
-
-    fn from_asc_bytes(asc_obj: &[u8]) -> Result<Self, DeterministicHostError> {
-        let mut u32_bytes: [u8; size_of::<u32>()] = [0; size_of::<u32>()];
-        if std::mem::size_of_val(&u32_bytes) != std::mem::size_of_val(&asc_obj) {
-            return Err(DeterministicHostError(anyhow::anyhow!(
-                "Invalid asc bytes size"
-            )));
-        }
-        u32_bytes.copy_from_slice(&asc_obj);
-        let discr = u32::from_le_bytes(u32_bytes);
-        match discr {
-            0u32 => Ok(Self::String),
-            _ => Err(DeterministicHostError(anyhow::anyhow!(
-                "value {} is out of range for {}",
-                discr,
-                "IndexForAscTypeId"
-            ))),
-        }
-    }
+    String = 0,
+    ArrayBuffer = 1,
+    Int8Array = 2,
+    Int16Array = 3,
+    Int32Array = 4,
+    Int64Array = 5,
+    Uint8Array = 6,
+    Uint16Array = 7,
+    Uint32Array = 8,
+    Uint64Array = 9,
+    Float32Array = 10,
+    Float64Array = 11,
+    BigDecimal = 12,
+    ArrayBool = 13,
+    ArrayUint8Array = 14,
+    ArrayEthereumValue = 15,
+    ArrayStoreValue = 16,
+    ArrayJsonValue = 17,
+    ArrayString = 18,// *
+    ArrayEventParam = 19,
+    ArrayTypedMapEntryStringJsonValue = 20,
+    ArrayTypedMapEntryStringStoreValue = 21,
+    SmartContractCall = 22,
+    EventParam = 23,
+    EthereumTransaction = 24,
+    EthereumBlock = 25,
+    EthereumCall = 26,
+    WrappedTypedMapStringJsonValue = 27,
+    WrappedBool = 28,
+    WrappedJsonValue = 29,
+    EthereumValue = 30,
+    StoreValue = 31,
+    JsonValue = 32,
+    EthereumEvent = 33,
+    TypedMapEntryStringStoreValue = 34,
+    TypedMapEntryStringJsonValue = 35,
+    TypedMapStringStoreValue = 36,
+    TypedMapStringJsonValue = 37,
+    TypedMapStringTypedMapStringJsonValue = 38,
+    ResultTypedMapStringJsonValueBool = 39,
+    ResultJsonValueBool = 40,
+    ArrayU8 = 41,
+    ArrayU16 = 42,
+    ArrayU32 = 43,
+    ArrayU64 = 44,
+    ArrayI8 = 45,
+    ArrayI16 = 46,
+    ArrayI32 = 47,
+    ArrayI64 = 48,
+    ArrayF32 = 49,
+    ArrayF64 = 50,
+    ArrayBigDecimal = 51,
 }
 
 impl ToAscObj<u32> for IndexForAscTypeId {

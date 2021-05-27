@@ -1,11 +1,41 @@
 enum IndexForAscTypeId {
   STRING = 0,
+  ARRAY_BUFFER = 1,
+  UINT8_ARRAY = 6,
+  ARRAY_TYPED_MAP_ENTRY_STRING_JSON_VALUE = 20,
+  ARRAY_TYPED_MAP_ENTRY_STRING_STORE_VALUE = 21,
+  STORE_VALUE = 31,
+  JSON_VALUE = 32,
+  TYPED_MAP_ENTRY_STRING_STORE_VALUE = 34,
+  TYPED_MAP_ENTRY_STRING_JSON_VALUE = 35,
+  TYPED_MAP_STRING_STORE_VALUE = 36,
+  TYPED_MAP_STRING_JSON_VALUE = 37,
 }
 
 export function id_of_type(type_id_index: IndexForAscTypeId): usize {
   switch (type_id_index) {
     case IndexForAscTypeId.STRING:
-      return idof<String>();
+      return idof<string>();
+    case IndexForAscTypeId.ARRAY_BUFFER:
+      return idof<ArrayBuffer>();
+    case IndexForAscTypeId.UINT8_ARRAY:
+      return idof<Uint8Array>();
+    case IndexForAscTypeId.ARRAY_TYPED_MAP_ENTRY_STRING_JSON_VALUE:
+      return idof<Array<TypedMapEntry<string, JSONValue>>>();
+    case IndexForAscTypeId.ARRAY_TYPED_MAP_ENTRY_STRING_STORE_VALUE:
+      return idof<Array<Entity>>();
+    case IndexForAscTypeId.STORE_VALUE:
+      return idof<Value>();
+    case IndexForAscTypeId.JSON_VALUE:
+      return idof<JSONValue>();
+    case IndexForAscTypeId.TYPED_MAP_ENTRY_STRING_STORE_VALUE:
+      return idof<Entity>();
+    case IndexForAscTypeId.TYPED_MAP_ENTRY_STRING_JSON_VALUE:
+      return idof<TypedMapEntry<string, JSONValue>>();
+    case IndexForAscTypeId.TYPED_MAP_STRING_STORE_VALUE:
+      return idof<TypedMap<string, Value>>();
+    case IndexForAscTypeId.TYPED_MAP_STRING_JSON_VALUE:
+      return idof<TypedMap<string, JSONValue>>();
     default:
       return 0;
   }

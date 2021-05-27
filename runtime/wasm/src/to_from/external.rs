@@ -4,7 +4,7 @@ use graph::{
     components::ethereum::{
         EthereumBlockData, EthereumCallData, EthereumEventData, EthereumTransactionData,
     },
-    runtime::{AscPtr, AscType, ToAscObj},
+    runtime::{AscIndexId, AscPtr, AscType, ToAscObj},
 };
 use graph::{data::store, runtime::DeterministicHostError};
 use graph::{prelude::serde_json, runtime::FromAscObj};
@@ -215,6 +215,7 @@ impl TryFromAscObj<AscEnum<StoreValueKind>> for store::Value {
         use self::store::Value;
 
         let payload = asc_enum.payload;
+        println!("the payload: {}", payload.0);
         Ok(match asc_enum.kind {
             StoreValueKind::String => {
                 let ptr: AscPtr<AscString> = AscPtr::from(payload);
@@ -395,7 +396,7 @@ impl ToAscObj<AscEthereumTransaction_0_0_2> for EthereumTransactionData {
     }
 }
 
-impl<T: AscType> ToAscObj<AscEthereumEvent<T>> for EthereumEventData
+impl<T: AscType + AscIndexId> ToAscObj<AscEthereumEvent<T>> for EthereumEventData
 where
     EthereumTransactionData: ToAscObj<T>,
 {
@@ -507,8 +508,10 @@ impl<V, E, VAsc, EAsc> ToAscObj<AscResult<VAsc, EAsc>> for Result<V, E>
 where
     V: ToAscObj<VAsc>,
     E: ToAscObj<EAsc>,
-    VAsc: AscType,
-    EAsc: AscType,
+    VAsc: AscType + AscIndexId,
+    EAsc: AscType + AscIndexId,
+    AscWrapped<VAsc>: AscIndexId,
+    AscWrapped<EAsc>: AscIndexId,
 {
     fn to_asc_obj<H: AscHeap>(
         &self,

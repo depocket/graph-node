@@ -1,11 +1,23 @@
 enum IndexForAscTypeId {
   STRING = 0,
+  ARRAY_BUFFER = 1,
+  UINT8_ARRAY = 6,
+  ARRAY_ETHEREUM_VALUE = 15,
+  ETHEREUM_VALUE = 30,
 }
 
 export function id_of_type(type_id_index: IndexForAscTypeId): usize {
   switch (type_id_index) {
     case IndexForAscTypeId.STRING:
-      return idof<String>();
+      return idof<string>();
+    case IndexForAscTypeId.ARRAY_BUFFER:
+      return idof<ArrayBuffer>();
+    case IndexForAscTypeId.UINT8_ARRAY:
+      return idof<Uint8Array>();
+    case IndexForAscTypeId.ARRAY_ETHEREUM_VALUE:
+      return idof<Array<Token>>();
+    case IndexForAscTypeId.ETHEREUM_VALUE:
+      return idof<Token>();
     default:
       return 0;
   }

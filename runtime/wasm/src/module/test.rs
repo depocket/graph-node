@@ -593,7 +593,7 @@ async fn abort() {
     assert!(res
         .unwrap_err()
         .to_string()
-        .contains("line 6, column 2, with message: not true"));
+        .contains("line 25, column 3, with message: not true"));
 }
 
 #[tokio::test]

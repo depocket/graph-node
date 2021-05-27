@@ -3,7 +3,8 @@ use std::hash::Hash;
 use std::iter::FromIterator;
 
 use graph::runtime::{
-    AscHeap, AscPtr, AscType, AscValue, DeterministicHostError, FromAscObj, ToAscObj, TryFromAscObj,
+    AscHeap, AscIndexId, AscPtr, AscType, AscValue, DeterministicHostError, FromAscObj, ToAscObj,
+    TryFromAscObj,
 };
 
 use crate::asc_abi::class::*;
@@ -115,7 +116,9 @@ impl TryFromAscObj<AscString> for String {
     }
 }
 
-impl<C: AscType, T: ToAscObj<C>> ToAscObj<Array<AscPtr<C>>> for [T] {
+impl<C: AscType + AscIndexId, T: ToAscObj<C>> ToAscObj<Array<AscPtr<C>>> for [T]
+// where TypedArray<AscPtr<C>>: AscIndexId
+{
     fn to_asc_obj<H: AscHeap>(
         &self,
         heap: &mut H,
@@ -126,7 +129,7 @@ impl<C: AscType, T: ToAscObj<C>> ToAscObj<Array<AscPtr<C>>> for [T] {
     }
 }
 
-impl<C: AscType, T: FromAscObj<C>> FromAscObj<Array<AscPtr<C>>> for Vec<T> {
+impl<C: AscType + AscIndexId, T: FromAscObj<C>> FromAscObj<Array<AscPtr<C>>> for Vec<T> {
     fn from_asc_obj<H: AscHeap>(
         array: Array<AscPtr<C>>,
         heap: &H,
@@ -139,7 +142,7 @@ impl<C: AscType, T: FromAscObj<C>> FromAscObj<Array<AscPtr<C>>> for Vec<T> {
     }
 }
 
-impl<C: AscType, T: TryFromAscObj<C>> TryFromAscObj<Array<AscPtr<C>>> for Vec<T> {
+impl<C: AscType + AscIndexId, T: TryFromAscObj<C>> TryFromAscObj<Array<AscPtr<C>>> for Vec<T> {
     fn try_from_asc_obj<H: AscHeap>(
         array: Array<AscPtr<C>>,
         heap: &H,
@@ -152,8 +155,12 @@ impl<C: AscType, T: TryFromAscObj<C>> TryFromAscObj<Array<AscPtr<C>>> for Vec<T>
     }
 }
 
-impl<K: AscType, V: AscType, T: TryFromAscObj<K>, U: TryFromAscObj<V>>
-    TryFromAscObj<AscTypedMapEntry<K, V>> for (T, U)
+impl<
+        K: AscType + AscIndexId,
+        V: AscType + AscIndexId,
+        T: TryFromAscObj<K>,
+        U: TryFromAscObj<V>,
+    > TryFromAscObj<AscTypedMapEntry<K, V>> for (T, U)
 {
     fn try_from_asc_obj<H: AscHeap>(
         asc_entry: AscTypedMapEntry<K, V>,
@@ -166,8 +173,8 @@ impl<K: AscType, V: AscType, T: TryFromAscObj<K>, U: TryFromAscObj<V>>
     }
 }
 
-impl<K: AscType, V: AscType, T: ToAscObj<K>, U: ToAscObj<V>> ToAscObj<AscTypedMapEntry<K, V>>
-    for (T, U)
+impl<K: AscType + AscIndexId, V: AscType + AscIndexId, T: ToAscObj<K>, U: ToAscObj<V>>
+    ToAscObj<AscTypedMapEntry<K, V>> for (T, U)
 {
     fn to_asc_obj<H: AscHeap>(
         &self,
@@ -180,8 +187,15 @@ impl<K: AscType, V: AscType, T: ToAscObj<K>, U: ToAscObj<V>> ToAscObj<AscTypedMa
     }
 }
 
-impl<K: AscType, V: AscType, T: TryFromAscObj<K> + Hash + Eq, U: TryFromAscObj<V>>
-    TryFromAscObj<AscTypedMap<K, V>> for HashMap<T, U>
+impl<
+        K: AscType + AscIndexId,
+        V: AscType + AscIndexId,
+        T: TryFromAscObj<K> + Hash + Eq,
+        U: TryFromAscObj<V>,
+    > TryFromAscObj<AscTypedMap<K, V>> for HashMap<T, U>
+where
+    Array<AscPtr<AscTypedMapEntry<K, V>>>: AscIndexId,
+    AscTypedMapEntry<K, V>: AscIndexId,
 {
     fn try_from_asc_obj<H: AscHeap>(
         asc_map: AscTypedMap<K, V>,
