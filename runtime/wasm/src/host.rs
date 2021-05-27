@@ -16,7 +16,6 @@ use graph::{
     blockchain::{Blockchain, DataSource, MappingTrigger as _},
     components::store::CallCache,
 };
-use graph_chain_ethereum::MappingTrigger;
 use graph_chain_ethereum::{EthereumAdapterTrait, EthereumNetworks};
 
 use crate::mapping::{MappingContext, MappingRequest};
@@ -217,7 +216,7 @@ where
         &self,
         logger: &Logger,
         state: BlockState<C>,
-        trigger: MappingTrigger,
+        trigger: C::MappingTrigger,
         block_ptr: BlockPtr,
         proof_of_indexing: SharedProofOfIndexing,
     ) -> Result<BlockState<C>, MappingError> {
@@ -225,7 +224,7 @@ where
 
         let extras = trigger.logging_extras();
         trace!(
-            logger, "Start processing Ethereum trigger";
+            logger, "Start processing trigger";
             &extras,
             "handler" => &handler,
             "data_source" => &self.data_source.name(),
@@ -260,7 +259,7 @@ where
         metrics.observe_handler_execution_time(elapsed.as_secs_f64(), &handler);
 
         info!(
-            logger, "Done processing Ethereum trigger";
+            logger, "Done processing trigger";
             &extras,
             "total_ms" => elapsed.as_millis(),
             "handler" => handler,

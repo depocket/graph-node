@@ -1,3 +1,5 @@
+// mod asc_types;
+
 use ethabi::LogParam;
 use graph::blockchain;
 use graph::blockchain::TriggerData;
@@ -6,6 +8,10 @@ use graph::prelude::BlockPtr;
 use graph::prelude::{
     CheapClone, EthereumCall, MappingBlockHandler, MappingCallHandler, MappingEventHandler,
 };
+use graph::runtime::AscHeap;
+use graph::runtime::AscPtr;
+use graph::runtime::DeterministicHostError;
+use graph::semver::Version;
 use graph::slog::{o, SendSyncRefUnwindSafeKV};
 use std::convert::TryFrom;
 use std::{cmp::Ordering, sync::Arc};
@@ -95,8 +101,16 @@ impl std::fmt::Debug for MappingTrigger {
     }
 }
 
-impl MappingTrigger {
-    pub fn logging_extras(&self) -> Box<dyn SendSyncRefUnwindSafeKV> {
+impl blockchain::MappingTrigger for MappingTrigger {
+    fn handler_name(&self) -> &str {
+        match self {
+            MappingTrigger::Log { handler, .. } => &handler.handler,
+            MappingTrigger::Call { handler, .. } => &handler.handler,
+            MappingTrigger::Block { handler, .. } => &handler.handler,
+        }
+    }
+
+    fn logging_extras(&self) -> Box<dyn SendSyncRefUnwindSafeKV> {
         match self {
             MappingTrigger::Log { handler, log, .. } => Box::new(o! {
                 "signature" => handler.event.to_string(),
@@ -109,14 +123,76 @@ impl MappingTrigger {
             MappingTrigger::Block { .. } => Box::new(o! {}),
         }
     }
-}
 
-impl blockchain::MappingTrigger for MappingTrigger {
-    fn handler_name(&self) -> &str {
+    #[allow(unused_variables)]
+    fn to_asc<H: AscHeap>(&self, heap: &mut H) -> Result<AscPtr<()>, DeterministicHostError> {
         match self {
-            MappingTrigger::Log { handler, .. } => &handler.handler,
-            MappingTrigger::Call { handler, .. } => &handler.handler,
-            MappingTrigger::Block { handler, .. } => &handler.handler,
+            MappingTrigger::Log {
+                block,
+                transaction,
+                log,
+                params,
+                handler,
+            } => {
+                todo!()
+                // if heap.api_version() >= Version::new(0, 0, 2) {
+                //     self.asc_new::<asc_types::AscEthereumEvent<AscEthereumTransaction_0_0_2>, _>(
+                //         &EthereumEventData {
+                //             block: EthereumBlockData::from(block.as_ref()),
+                //             transaction: EthereumTransactionData::from(transaction.deref()),
+                //             address: log.address,
+                //             log_index: log.log_index.unwrap_or(U256::zero()),
+                //             transaction_log_index: log.log_index.unwrap_or(U256::zero()),
+                //             log_type: log.log_type.clone(),
+                //             params,
+                //         },
+                //     )?
+                //     .erase()
+                // } else {
+                //     self.asc_new::<AscEthereumEvent<AscEthereumTransaction>, _>(
+                //         &EthereumEventData {
+                //             block: EthereumBlockData::from(block.as_ref()),
+                //             transaction: EthereumTransactionData::from(transaction.deref()),
+                //             address: log.address,
+                //             log_index: log.log_index.unwrap_or(U256::zero()),
+                //             transaction_log_index: log.log_index.unwrap_or(U256::zero()),
+                //             log_type: log.log_type.clone(),
+                //             params,
+                //         },
+                //     )?
+                //     .erase()
+                // };
+            }
+            MappingTrigger::Call {
+                block,
+                transaction,
+                call,
+                inputs,
+                outputs,
+                handler,
+            } => {
+                // let call = EthereumCallData {
+                //     to: call.to,
+                //     from: call.from,
+                //     block: EthereumBlockData::from(block.as_ref()),
+                //     transaction: EthereumTransactionData::from(transaction.deref()),
+                //     inputs,
+                //     outputs,
+                // };
+                // let arg = if self.instance_ctx().ctx.host_exports.api_version >= Version::new(0, 0, 3) {
+                //     self.asc_new::<AscEthereumCall_0_0_3, _>(&call)?.erase()
+                // } else {
+                //     self.asc_new::<AscEthereumCall, _>(&call)?.erase()
+                // };
+                todo!()
+            }
+            MappingTrigger::Block { block, handler } => {
+                todo!()
+                // let block = EthereumBlockData::from(block.as_ref());
+
+                // // Prepare an EthereumBlock for the WASM runtime
+                // let arg = self.asc_new(&block)?;
+            }
         }
     }
 }

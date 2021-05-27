@@ -1,11 +1,10 @@
 use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::ops::Deref;
 use std::rc::Rc;
 use std::time::Instant;
 
-use graph::blockchain::Blockchain;
+use graph::blockchain::{Blockchain, MappingTrigger};
 use never::Never;
 use semver::Version;
 use wasmtime::{Memory, Trap};
@@ -14,13 +13,11 @@ use crate::error::DeterminismLevel;
 use crate::host_exports;
 use crate::mapping::MappingContext;
 use anyhow::Error;
-use ethabi::LogParam;
 use graph::prelude::*;
 use graph::{components::subgraph::MappingError, runtime::AscPtr};
 use graph::{data::store, runtime::AscHeap};
 use graph::{data::subgraph::schema::SubgraphError, runtime::DeterministicHostError};
 use host_exports::HostExportError;
-use web3::types::{Log, Transaction, U256};
 
 use crate::asc_abi::class::*;
 use crate::host_exports::{EthereumCallError, HostExports};
@@ -103,81 +100,12 @@ impl<C: Blockchain> WasmInstance<C> {
         Ok(self.take_ctx().ctx.state)
     }
 
-    pub(crate) fn handle_ethereum_log(
+    pub(crate) fn handle_trigger(
         mut self,
-        block: Arc<LightEthereumBlock>,
-        handler_name: &str,
-        transaction: Arc<Transaction>,
-        log: Arc<Log>,
-        params: Vec<LogParam>,
+        trigger: C::MappingTrigger,
     ) -> Result<BlockState<C>, MappingError> {
-        // Prepare an EthereumEvent for the WASM runtime
-        // Decide on the destination type using the mapping
-        // api version provided in the subgraph manifest
-        let event = if self.instance_ctx().ctx.host_exports.api_version >= Version::new(0, 0, 2) {
-            self.asc_new::<AscEthereumEvent<AscEthereumTransaction_0_0_2>, _>(&EthereumEventData {
-                block: EthereumBlockData::from(block.as_ref()),
-                transaction: EthereumTransactionData::from(transaction.deref()),
-                address: log.address,
-                log_index: log.log_index.unwrap_or(U256::zero()),
-                transaction_log_index: log.log_index.unwrap_or(U256::zero()),
-                log_type: log.log_type.clone(),
-                params,
-            })?
-            .erase()
-        } else {
-            self.asc_new::<AscEthereumEvent<AscEthereumTransaction>, _>(&EthereumEventData {
-                block: EthereumBlockData::from(block.as_ref()),
-                transaction: EthereumTransactionData::from(transaction.deref()),
-                address: log.address,
-                log_index: log.log_index.unwrap_or(U256::zero()),
-                transaction_log_index: log.log_index.unwrap_or(U256::zero()),
-                log_type: log.log_type.clone(),
-                params,
-            })?
-            .erase()
-        };
-
-        self.invoke_handler(handler_name, event)
-    }
-
-    pub(crate) fn handle_ethereum_call(
-        mut self,
-        block: Arc<LightEthereumBlock>,
-        handler_name: &str,
-        transaction: Arc<Transaction>,
-        call: Arc<EthereumCall>,
-        inputs: Vec<LogParam>,
-        outputs: Vec<LogParam>,
-    ) -> Result<BlockState<C>, MappingError> {
-        let call = EthereumCallData {
-            to: call.to,
-            from: call.from,
-            block: EthereumBlockData::from(block.as_ref()),
-            transaction: EthereumTransactionData::from(transaction.deref()),
-            inputs,
-            outputs,
-        };
-        let arg = if self.instance_ctx().ctx.host_exports.api_version >= Version::new(0, 0, 3) {
-            self.asc_new::<AscEthereumCall_0_0_3, _>(&call)?.erase()
-        } else {
-            self.asc_new::<AscEthereumCall, _>(&call)?.erase()
-        };
-
-        self.invoke_handler(handler_name, arg)
-    }
-
-    pub(crate) fn handle_ethereum_block(
-        mut self,
-        block: Arc<LightEthereumBlock>,
-        handler_name: &str,
-    ) -> Result<BlockState<C>, MappingError> {
-        let block = EthereumBlockData::from(block.as_ref());
-
-        // Prepare an EthereumBlock for the WASM runtime
-        let arg = self.asc_new(&block)?;
-
-        self.invoke_handler(handler_name, arg)
+        let asc_trigger = trigger.to_asc(&mut self)?;
+        self.invoke_handler(trigger.handler_name(), asc_trigger)
     }
 
     pub(crate) fn take_ctx(&mut self) -> WasmInstanceContext<C> {

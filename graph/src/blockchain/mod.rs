@@ -11,6 +11,7 @@ use crate::{
     components::store::{DeploymentLocator, StoredDynamicDataSource},
     data::subgraph::{Mapping, Source, TemplateSource},
     prelude::DataSourceContext,
+    runtime::{AscHeap, AscPtr, DeterministicHostError},
 };
 use crate::{
     components::{
@@ -22,8 +23,8 @@ use crate::{
 use anyhow::Error;
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
-use slog;
 use slog::Logger;
+use slog::{self, SendSyncRefUnwindSafeKV};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::{collections::HashMap, convert::TryFrom};
@@ -73,7 +74,7 @@ pub trait Blockchain: Debug + Sized + Send + Sync + 'static {
     type TriggerData: TriggerData + Ord;
 
     /// Decoded trigger ready to be processed by the mapping.
-    type MappingTrigger: MappingTrigger;
+    type MappingTrigger: MappingTrigger + Debug;
 
     /// Trigger filter used as input to the triggers adapter.
     type TriggerFilter: TriggerFilter<Self>;
@@ -264,6 +265,15 @@ pub trait TriggerData {
     fn error_context(&self) -> String;
 }
 
-pub trait MappingTrigger {
+pub trait MappingTrigger: Send + Sync {
     fn handler_name(&self) -> &str;
+
+    /// A flexible interface for writing a type to AS memory, any pointer can be returned.
+    /// Use `AscPtr::erased` to convert `AscPtr<T>` into `AscPtr<()>`.
+    fn to_asc<H: AscHeap>(&self, heap: &mut H) -> Result<AscPtr<()>, DeterministicHostError>;
+
+    /// Additional key-value pairs to be logged with the "Done processing trigger" message.
+    fn logging_extras(&self) -> Box<dyn SendSyncRefUnwindSafeKV> {
+        Box::new(slog::o! {})
+    }
 }

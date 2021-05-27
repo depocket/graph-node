@@ -4,7 +4,6 @@ use futures03::channel::oneshot::Sender;
 use graph::blockchain::Blockchain;
 use graph::components::subgraph::{MappingError, SharedProofOfIndexing};
 use graph::prelude::*;
-use graph_chain_ethereum::MappingTrigger;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
@@ -66,39 +65,7 @@ pub fn spawn_module<C: Blockchain>(
                     if *LOG_TRIGGER_DATA {
                         debug!(logger, "trigger data: {:?}", trigger);
                     }
-                    let result = match trigger {
-                        MappingTrigger::Log {
-                            block,
-                            transaction,
-                            log,
-                            params,
-                            handler,
-                        } => module.handle_ethereum_log(
-                            block,
-                            handler.handler.as_str(),
-                            transaction,
-                            log,
-                            params,
-                        ),
-                        MappingTrigger::Call {
-                            block,
-                            transaction,
-                            call,
-                            inputs,
-                            outputs,
-                            handler,
-                        } => module.handle_ethereum_call(
-                            block,
-                            handler.handler.as_str(),
-                            transaction,
-                            call,
-                            inputs,
-                            outputs,
-                        ),
-                        MappingTrigger::Block { block, handler } => {
-                            module.handle_ethereum_block(block, handler.handler.as_str())
-                        }
-                    };
+                    let result = module.handle_trigger(trigger);
                     section.end();
 
                     result_sender
@@ -122,7 +89,7 @@ pub fn spawn_module<C: Blockchain>(
 #[derive(Debug)]
 pub struct MappingRequest<C: Blockchain> {
     pub(crate) ctx: MappingContext<C>,
-    pub(crate) trigger: MappingTrigger,
+    pub(crate) trigger: C::MappingTrigger,
     pub(crate) result_sender: Sender<Result<BlockState<C>, MappingError>>,
 }
 
