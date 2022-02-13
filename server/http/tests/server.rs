@@ -1,18 +1,18 @@
 use http::StatusCode;
 use hyper::{Body, Client, Request};
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use graph::data::{
     graphql::effort::LoadManager,
     query::{QueryResults, QueryTarget},
+    value::Object,
 };
 use graph::prelude::*;
 
 use graph_server_http::test_utils;
 use graph_server_http::GraphQLServer as HyperGraphQLServer;
 
-use tokio::time::delay_for;
+use tokio::time::sleep;
 
 /// A simple stupid query runner for testing.
 pub struct TestGraphQlRunner;
@@ -27,17 +27,11 @@ impl GraphQlRunner for TestGraphQlRunner {
         _max_depth: Option<u8>,
         _max_first: Option<u32>,
         _max_skip: Option<u32>,
-        _nested_resolver: bool,
     ) -> QueryResults {
         unimplemented!();
     }
 
-    async fn run_query(
-        self: Arc<Self>,
-        query: Query,
-        _target: QueryTarget,
-        _: bool,
-    ) -> QueryResults {
+    async fn run_query(self: Arc<Self>, query: Query, _target: QueryTarget) -> QueryResults {
         if query.variables.is_some()
             && query
                 .variables
@@ -50,16 +44,16 @@ impl GraphQlRunner for TestGraphQlRunner {
                 .unwrap()
                 .get(&String::from("equals"))
                 .unwrap()
-                == &q::Value::String(String::from("John"))
+                == &r::Value::String(String::from("John"))
         {
-            BTreeMap::from_iter(
-                vec![(String::from("name"), q::Value::String(String::from("John")))].into_iter(),
+            Object::from_iter(
+                vec![(String::from("name"), r::Value::String(String::from("John")))].into_iter(),
             )
         } else {
-            BTreeMap::from_iter(
+            Object::from_iter(
                 vec![(
                     String::from("name"),
-                    q::Value::String(String::from("Jordi")),
+                    r::Value::String(String::from("Jordi")),
                 )]
                 .into_iter(),
             )
@@ -91,7 +85,7 @@ mod test {
 
     #[test]
     fn rejects_empty_json() {
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime
             .block_on(async {
                 let logger = Logger::root(slog::Discard, o!());
@@ -102,18 +96,18 @@ mod test {
                 let node_id = NodeId::new("test").unwrap();
                 let mut server = HyperGraphQLServer::new(&logger_factory, metrics_registry, query_runner, node_id);
                 let http_server = server
-                    .serve(8001, 8002)
+                    .serve(8007, 8008)
                     .expect("Failed to start GraphQL server");
 
                 // Launch the server to handle a single request
                 tokio::spawn(http_server.fuse().compat());
                 // Give some time for the server to start.
-                delay_for(Duration::from_secs(2))
+                sleep(Duration::from_secs(2))
                     .then(move |()| {
                         // Send an empty JSON POST request
                         let client = Client::new();
                         let request =
-                            Request::post(format!("http://localhost:8001/subgraphs/id/{}", id))
+                            Request::post(format!("http://localhost:8007/subgraphs/id/{}", id))
                                 .body(Body::from("{}"))
                                 .unwrap();
 
@@ -134,7 +128,7 @@ mod test {
 
     #[test]
     fn rejects_invalid_queries() {
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let logger = Logger::root(slog::Discard, o!());
             let logger_factory = LoggerFactory::new(logger, None);
@@ -151,7 +145,7 @@ mod test {
             // Launch the server to handle a single request
             tokio::spawn(http_server.fuse().compat());
             // Give some time for the server to start.
-            delay_for(Duration::from_secs(2))
+            sleep(Duration::from_secs(2))
                 .then(move |()| {
                     // Send an broken query request
                     let client = Client::new();
@@ -216,7 +210,7 @@ mod test {
 
     #[test]
     fn accepts_valid_queries() {
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let logger = Logger::root(slog::Discard, o!());
             let logger_factory = LoggerFactory::new(logger, None);
@@ -233,7 +227,7 @@ mod test {
             // Launch the server to handle a single request
             tokio::spawn(http_server.fuse().compat());
             // Give some time for the server to start.
-            delay_for(Duration::from_secs(2))
+            sleep(Duration::from_secs(2))
                 .then(move |()| {
                     // Send a valid example query
                     let client = Client::new();
@@ -263,7 +257,7 @@ mod test {
 
     #[test]
     fn accepts_valid_queries_with_variables() {
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         let _ = runtime.block_on(async {
             let logger = Logger::root(slog::Discard, o!());
             let logger_factory = LoggerFactory::new(logger, None);
@@ -280,7 +274,7 @@ mod test {
             // Launch the server to handle a single request
             tokio::spawn(http_server.fuse().compat());
             // Give some time for the server to start.
-            delay_for(Duration::from_secs(2))
+            sleep(Duration::from_secs(2))
                 .then(move |()| {
                     // Send a valid example query
                     let client = Client::new();

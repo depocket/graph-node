@@ -5,22 +5,19 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::sync::mpsc::Sender;
 use futures03::channel::oneshot::channel;
-use graph::components::arweave::ArweaveAdapter;
-use graph::components::store::SubgraphStore;
+
+use graph::blockchain::RuntimeAdapter;
+use graph::blockchain::{Blockchain, DataSource};
+use graph::blockchain::{HostFn, TriggerWithHandler};
+use graph::components::store::{EnsLookup, SubgraphFork};
 use graph::components::subgraph::{MappingError, SharedProofOfIndexing};
-use graph::components::three_box::ThreeBoxAdapter;
 use graph::prelude::{
     RuntimeHost as RuntimeHostTrait, RuntimeHostBuilder as RuntimeHostBuilderTrait, *,
 };
-use graph::{
-    blockchain::{Blockchain, DataSource, MappingTrigger as _},
-    components::store::CallCache,
-};
-use graph_chain_ethereum::MappingTrigger;
-use graph_chain_ethereum::{EthereumAdapterTrait, EthereumNetworks};
 
 use crate::mapping::{MappingContext, MappingRequest};
 use crate::{host_exports::HostExports, module::ExperimentalFeatures};
+use graph::runtime::gas::Gas;
 
 lazy_static! {
     static ref TIMEOUT: Option<Duration> = std::env::var("GRAPH_MAPPING_HANDLER_TIMEOUT")
@@ -29,72 +26,39 @@ lazy_static! {
         .map(Duration::from_secs);
     static ref ALLOW_NON_DETERMINISTIC_IPFS: bool =
         std::env::var("GRAPH_ALLOW_NON_DETERMINISTIC_IPFS").is_ok();
-    static ref ALLOW_NON_DETERMINISTIC_3BOX: bool =
-        std::env::var("GRAPH_ALLOW_NON_DETERMINISTIC_3BOX").is_ok();
-    static ref ALLOW_NON_DETERMINISTIC_ARWEAVE: bool =
-        std::env::var("GRAPH_ALLOW_NON_DETERMINISTIC_ARWEAVE").is_ok();
 }
 
-pub struct RuntimeHostBuilder<S, CC> {
-    ethereum_networks: EthereumNetworks,
+pub struct RuntimeHostBuilder<C: Blockchain> {
+    runtime_adapter: Arc<C::RuntimeAdapter>,
     link_resolver: Arc<dyn LinkResolver>,
-    store: Arc<S>,
-    caches: Arc<CC>,
-    arweave_adapter: Arc<dyn ArweaveAdapter>,
-    three_box_adapter: Arc<dyn ThreeBoxAdapter>,
+    ens_lookup: Arc<dyn EnsLookup>,
 }
 
-impl<S, CC> Clone for RuntimeHostBuilder<S, CC>
-where
-    S: SubgraphStore,
-    CC: CallCache,
-{
+impl<C: Blockchain> Clone for RuntimeHostBuilder<C> {
     fn clone(&self) -> Self {
         RuntimeHostBuilder {
-            ethereum_networks: self.ethereum_networks.clone(),
-            link_resolver: self.link_resolver.clone(),
-            store: self.store.clone(),
-            caches: self.caches.clone(),
-            arweave_adapter: self.arweave_adapter.cheap_clone(),
-            three_box_adapter: self.three_box_adapter.cheap_clone(),
+            runtime_adapter: self.runtime_adapter.cheap_clone(),
+            link_resolver: self.link_resolver.cheap_clone(),
+            ens_lookup: self.ens_lookup.cheap_clone(),
         }
     }
 }
 
-impl<S, CC> RuntimeHostBuilder<S, CC>
-where
-    S: SubgraphStore,
-    CC: CallCache,
-{
+impl<C: Blockchain> RuntimeHostBuilder<C> {
     pub fn new(
-        ethereum_networks: EthereumNetworks,
+        runtime_adapter: Arc<C::RuntimeAdapter>,
         link_resolver: Arc<dyn LinkResolver>,
-        store: Arc<S>,
-        caches: Arc<CC>,
-        arweave_adapter: Arc<dyn ArweaveAdapter>,
-        three_box_adapter: Arc<dyn ThreeBoxAdapter>,
+        ens_lookup: Arc<dyn EnsLookup>,
     ) -> Self {
         RuntimeHostBuilder {
-            ethereum_networks,
+            runtime_adapter,
             link_resolver,
-            store,
-            caches,
-            arweave_adapter,
-            three_box_adapter,
+            ens_lookup,
         }
     }
 }
 
-impl<C, S, CC> RuntimeHostBuilderTrait<C> for RuntimeHostBuilder<S, CC>
-where
-    S: SubgraphStore,
-    CC: CallCache,
-    C: Blockchain<
-        Block = graph_chain_ethereum::WrappedBlockFinality,
-        MappingTrigger = graph_chain_ethereum::MappingTrigger,
-        DataSource = graph_chain_ethereum::DataSource,
-    >,
-{
+impl<C: Blockchain> RuntimeHostBuilderTrait<C> for RuntimeHostBuilder<C> {
     type Host = RuntimeHost<C>;
     type Req = MappingRequest<C>;
 
@@ -105,8 +69,6 @@ where
         metrics: Arc<HostMetrics>,
     ) -> Result<Sender<Self::Req>, Error> {
         let experimental_features = ExperimentalFeatures {
-            allow_non_deterministic_arweave: *ALLOW_NON_DETERMINISTIC_ARWEAVE,
-            allow_non_deterministic_3box: *ALLOW_NON_DETERMINISTIC_3BOX,
             allow_non_deterministic_ipfs: *ALLOW_NON_DETERMINISTIC_IPFS,
         };
         crate::mapping::spawn_module(
@@ -129,41 +91,22 @@ where
         mapping_request_sender: Sender<MappingRequest<C>>,
         metrics: Arc<HostMetrics>,
     ) -> Result<Self::Host, Error> {
-        let cache = self
-            .caches
-            .ethereum_call_cache(&network_name)
-            .ok_or_else(|| {
-                anyhow!(
-                    "No store found that matches subgraph network: \"{}\"",
-                    &network_name
-                )
-            })?;
-
-        let required_capabilities = data_source.mapping().required_capabilities();
-
-        let ethereum_adapter = self
-            .ethereum_networks
-            .adapter_with_capabilities(network_name.clone(), &required_capabilities)?;
-
-        Ok(RuntimeHost::new(
-            ethereum_adapter.clone(),
+        RuntimeHost::new(
+            self.runtime_adapter.cheap_clone(),
             self.link_resolver.clone(),
-            self.store.clone(),
-            cache,
             network_name,
             subgraph_id,
             data_source,
             templates,
             mapping_request_sender,
             metrics,
-            self.arweave_adapter.cheap_clone(),
-            self.three_box_adapter.cheap_clone(),
-        ))
+            self.ens_lookup.cheap_clone(),
+        )
     }
 }
 
-#[derive(Debug)]
 pub struct RuntimeHost<C: Blockchain> {
+    host_fns: Arc<Vec<HostFn>>,
     data_source: C::DataSource,
     mapping_request_sender: Sender<MappingRequest<C>>,
     host_exports: Arc<HostExports<C>>,
@@ -175,19 +118,16 @@ where
     C: Blockchain,
 {
     fn new(
-        ethereum_adapter: Arc<dyn EthereumAdapterTrait>,
+        runtime_adapter: Arc<C::RuntimeAdapter>,
         link_resolver: Arc<dyn LinkResolver>,
-        store: Arc<dyn crate::RuntimeStore>,
-        call_cache: Arc<dyn EthereumCallCache>,
         network_name: String,
         subgraph_id: DeploymentHash,
         data_source: C::DataSource,
         templates: Arc<Vec<C::DataSourceTemplate>>,
         mapping_request_sender: Sender<MappingRequest<C>>,
         metrics: Arc<HostMetrics>,
-        arweave_adapter: Arc<dyn ArweaveAdapter>,
-        three_box_adapter: Arc<dyn ThreeBoxAdapter>,
-    ) -> Self {
+        ens_lookup: Arc<dyn EnsLookup>,
+    ) -> Result<Self, Error> {
         // Create new instance of externally hosted functions invoker. The `Arc` is simply to avoid
         // implementing `Clone` for `HostExports`.
         let host_exports = Arc::new(HostExports::new(
@@ -195,20 +135,19 @@ where
             &data_source,
             network_name,
             templates,
-            ethereum_adapter,
             link_resolver,
-            store,
-            call_cache,
-            arweave_adapter,
-            three_box_adapter,
+            ens_lookup,
         ));
 
-        RuntimeHost {
+        let host_fns = Arc::new(runtime_adapter.host_fns(&data_source)?);
+
+        Ok(RuntimeHost {
+            host_fns,
             data_source,
             mapping_request_sender,
             host_exports,
             metrics,
-        }
+        })
     }
 
     /// Sends a MappingRequest to the thread which owns the host,
@@ -217,15 +156,16 @@ where
         &self,
         logger: &Logger,
         state: BlockState<C>,
-        trigger: MappingTrigger,
+        trigger: TriggerWithHandler<C>,
         block_ptr: BlockPtr,
         proof_of_indexing: SharedProofOfIndexing,
+        debug_fork: &Option<Arc<dyn SubgraphFork>>,
     ) -> Result<BlockState<C>, MappingError> {
         let handler = trigger.handler_name().to_string();
 
         let extras = trigger.logging_extras();
         trace!(
-            logger, "Start processing Ethereum trigger";
+            logger, "Start processing trigger";
             &extras,
             "handler" => &handler,
             "data_source" => &self.data_source.name(),
@@ -244,6 +184,8 @@ where
                     host_exports: self.host_exports.cheap_clone(),
                     block_ptr,
                     proof_of_indexing,
+                    host_fns: self.host_fns.cheap_clone(),
+                    debug_fork: debug_fork.cheap_clone(),
                 },
                 trigger,
                 result_sender,
@@ -259,29 +201,30 @@ where
         let elapsed = start_time.elapsed();
         metrics.observe_handler_execution_time(elapsed.as_secs_f64(), &handler);
 
+        // If there is an error, "gas_used" is incorrectly reported as 0.
+        let gas_used = result.as_ref().map(|(_, gas)| gas).unwrap_or(&Gas::ZERO);
         info!(
-            logger, "Done processing Ethereum trigger";
+            logger, "Done processing trigger";
             &extras,
             "total_ms" => elapsed.as_millis(),
             "handler" => handler,
             "data_source" => &self.data_source.name(),
+            "gas_used" => gas_used.to_string(),
         );
 
-        result
+        // Discard the gas value
+        result.map(|(block_state, _)| block_state)
     }
 }
 
 #[async_trait]
-impl<C> RuntimeHostTrait<C> for RuntimeHost<C>
-where
-    C: Blockchain<MappingTrigger = graph_chain_ethereum::MappingTrigger>,
-{
+impl<C: Blockchain> RuntimeHostTrait<C> for RuntimeHost<C> {
     fn match_and_decode(
         &self,
         trigger: &C::TriggerData,
         block: Arc<C::Block>,
         logger: &Logger,
-    ) -> Result<Option<C::MappingTrigger>, Error> {
+    ) -> Result<Option<TriggerWithHandler<C>>, Error> {
         self.data_source.match_and_decode(trigger, block, logger)
     }
 
@@ -289,12 +232,20 @@ where
         &self,
         logger: &Logger,
         block_ptr: BlockPtr,
-        trigger: C::MappingTrigger,
+        trigger: TriggerWithHandler<C>,
         state: BlockState<C>,
         proof_of_indexing: SharedProofOfIndexing,
+        debug_fork: &Option<Arc<dyn SubgraphFork>>,
     ) -> Result<BlockState<C>, MappingError> {
-        self.send_mapping_request(logger, state, trigger, block_ptr, proof_of_indexing)
-            .await
+        self.send_mapping_request(
+            logger,
+            state,
+            trigger,
+            block_ptr,
+            proof_of_indexing,
+            debug_fork,
+        )
+        .await
     }
 
     fn creation_block_number(&self) -> Option<BlockNumber> {

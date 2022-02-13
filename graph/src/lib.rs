@@ -22,10 +22,10 @@ pub mod blockchain;
 
 pub mod runtime;
 
-/// Module with mocks for different parts of the system.
-pub mod mock {
-    pub use crate::components::store::MockStore;
-}
+pub mod firehose;
+
+/// Helpers for parsing environment variables.
+pub mod env;
 
 /// Wrapper for spawning tasks that abort on panic, which is our default.
 mod task_spawn;
@@ -33,8 +33,8 @@ pub use task_spawn::{
     block_on, spawn, spawn_allow_panic, spawn_blocking, spawn_blocking_allow_panic, spawn_thread,
 };
 
+pub use anyhow;
 pub use bytes;
-pub use mockall;
 pub use parking_lot;
 pub use petgraph;
 pub use prometheus;
@@ -69,6 +69,7 @@ pub mod prelude {
     pub use futures03::stream::{StreamExt as _, TryStreamExt};
     pub use hex;
     pub use lazy_static::lazy_static;
+    pub use prost;
     pub use rand;
     pub use reqwest;
     pub use serde;
@@ -85,6 +86,7 @@ pub mod prelude {
     pub use thiserror;
     pub use tiny_keccak;
     pub use tokio;
+    pub use tonic;
     pub use web3;
 
     pub type DynTryFuture<'a, Ok = (), Err = Error> =
@@ -93,9 +95,8 @@ pub mod prelude {
     pub use crate::blockchain::BlockPtr;
 
     pub use crate::components::ethereum::{
-        BlockFinality, EthereumBlock, EthereumBlockData, EthereumBlockWithCalls, EthereumCall,
-        EthereumCallData, EthereumEventData, EthereumNetworkIdentifier, EthereumTransactionData,
-        LightEthereumBlock, LightEthereumBlockExt,
+        EthereumBlock, EthereumBlockWithCalls, EthereumCall, LightEthereumBlock,
+        LightEthereumBlockExt,
     };
     pub use crate::components::graphql::{
         GraphQlRunner, QueryLoadManager, SubscriptionResultFuture,
@@ -112,7 +113,7 @@ pub mod prelude {
     pub use crate::components::server::query::GraphQLServer;
     pub use crate::components::server::subscription::SubscriptionServer;
     pub use crate::components::store::{
-        BlockNumber, ChainStore, ChildMultiplicity, EntityCache, EntityChange,
+        AttributeNames, BlockNumber, ChainStore, ChildMultiplicity, EntityCache, EntityChange,
         EntityChangeOperation, EntityCollection, EntityFilter, EntityKey, EntityLink,
         EntityModification, EntityOperation, EntityOrder, EntityQuery, EntityRange, EntityWindow,
         EthereumCallCache, ParentLink, PoolWaitStats, QueryStore, QueryStoreManager, StoreError,
@@ -124,7 +125,7 @@ pub mod prelude {
         SubgraphAssignmentProvider, SubgraphInstanceManager, SubgraphRegistrar,
         SubgraphVersionSwitchingMode,
     };
-    pub use crate::components::{EventConsumer, EventProducer};
+    pub use crate::components::{transaction_receipt, EventConsumer, EventProducer};
 
     pub use crate::cheap_clone::CheapClone;
     pub use crate::data::graphql::{
@@ -142,11 +143,10 @@ pub mod prelude {
     };
     pub use crate::data::subgraph::schema::SubgraphDeploymentEntity;
     pub use crate::data::subgraph::{
-        BlockHandlerFilter, CreateSubgraphResult, DataSourceContext, DeploymentHash,
-        DeploymentState, Link, MappingABI, MappingBlockHandler, MappingCallHandler,
-        MappingEventHandler, SubgraphAssignmentProviderError, SubgraphManifest,
-        SubgraphManifestResolveError, SubgraphManifestValidationError, SubgraphName,
-        SubgraphRegistrarError, UnvalidatedSubgraphManifest,
+        CreateSubgraphResult, DataSourceContext, DeploymentHash, DeploymentState, Link,
+        SubgraphAssignmentProviderError, SubgraphManifest, SubgraphManifestResolveError,
+        SubgraphManifestValidationError, SubgraphName, SubgraphRegistrarError,
+        UnvalidatedSubgraphManifest,
     };
     pub use crate::data::subscription::{
         QueryResultStream, Subscription, SubscriptionError, SubscriptionResult,
@@ -184,11 +184,15 @@ pub mod prelude {
     static_graphql!(q, query, {
         Document, Value, OperationDefinition, InlineFragment, TypeCondition,
         FragmentSpread, Field, Selection, SelectionSet, FragmentDefinition,
-        Directive, VariableDefinition, Type,
+        Directive, VariableDefinition, Type, Query,
     });
     static_graphql!(s, schema, {
         Field, Directive, InterfaceType, ObjectType, Value, TypeDefinition,
         EnumType, Type, Document, ScalarType, InputValue, DirectiveDefinition,
         UnionType, InputObjectType, EnumValue,
     });
+
+    pub mod r {
+        pub use crate::data::value::Value;
+    }
 }

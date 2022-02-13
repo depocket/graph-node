@@ -12,11 +12,10 @@ fn find(
     pending: bool,
     used: bool,
 ) -> Result<Vec<Deployment>, anyhow::Error> {
-    let conn = pool.get()?;
     let current = current || used;
     let pending = pending || used;
 
-    let deployments = Deployment::lookup(&conn, name)?;
+    let deployments = Deployment::lookup(&pool, name)?;
     // Filter by status; if neither `current` or `pending` are set, list
     // all deployments
     let deployments: Vec<_> = deployments
@@ -40,9 +39,9 @@ pub fn run(
     used: bool,
 ) -> Result<(), anyhow::Error> {
     let deployments = find(pool, name, current, pending, used)?;
-    let hashes: Vec<_> = deployments.iter().map(|d| d.deployment.clone()).collect();
+    let ids: Vec<_> = deployments.iter().map(|d| d.locator().id).collect();
     let statuses = match store {
-        Some(store) => store.status(status::Filter::Deployments(hashes))?,
+        Some(store) => store.status(status::Filter::DeploymentIds(ids))?,
         None => vec![],
     };
 

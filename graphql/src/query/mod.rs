@@ -1,10 +1,10 @@
-use graph::prelude::{q, BlockPtr, CheapClone, QueryExecutionError, QueryResult};
+use graph::prelude::{BlockPtr, CheapClone, QueryExecutionError, QueryResult};
 use std::sync::Arc;
 use std::time::Instant;
 
 use graph::data::graphql::effort::LoadManager;
 
-use crate::execution::*;
+use crate::execution::{ast as a, *};
 
 /// Utilities for working with GraphQL query ASTs.
 pub mod ast;
@@ -33,10 +33,9 @@ pub struct QueryExecutionOptions<R> {
 /// If the query is not cacheable, the `Arc` may be unwrapped.
 pub async fn execute_query<R>(
     query: Arc<Query>,
-    selection_set: Option<q::SelectionSet>,
+    selection_set: Option<a::SelectionSet>,
     block_ptr: Option<BlockPtr>,
     options: QueryExecutionOptions<R>,
-    nested_resolver: bool,
 ) -> Arc<QueryResult>
 where
     R: Resolver,
@@ -50,8 +49,6 @@ where
         max_first: options.max_first,
         max_skip: options.max_skip,
         cache_status: Default::default(),
-        load_manager: options.load_manager.cheap_clone(),
-        nested_resolver,
     });
 
     if !query.is_query() {
@@ -64,7 +61,7 @@ where
         .unwrap_or_else(|| query.selection_set.cheap_clone());
 
     // Execute top-level `query { ... }` and `{ ... }` expressions.
-    let query_type = ctx.query.schema.query_type.cheap_clone();
+    let query_type = ctx.query.schema.query_type.cheap_clone().into();
     let start = Instant::now();
     let result = execute_root_selection_set(
         ctx.cheap_clone(),

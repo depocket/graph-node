@@ -69,9 +69,12 @@ impl Future for GraphQLRequest {
 mod tests {
     use graphql_parser;
     use hyper;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
 
-    use graph::{data::query::QueryTarget, prelude::*};
+    use graph::{
+        data::{query::QueryTarget, value::Object},
+        prelude::*,
+    };
 
     use super::GraphQLRequest;
 
@@ -170,14 +173,14 @@ mod tests {
             .into_static();
         let expected_variables = QueryVariables::new(HashMap::from_iter(
             vec![
-                (String::from("string"), q::Value::String(String::from("s"))),
+                (String::from("string"), r::Value::String(String::from("s"))),
                 (
                     String::from("map"),
-                    q::Value::Object(BTreeMap::from_iter(
-                        vec![(String::from("k"), q::Value::String(String::from("v")))].into_iter(),
+                    r::Value::Object(Object::from_iter(
+                        vec![(String::from("k"), r::Value::String(String::from("v")))].into_iter(),
                     )),
                 ),
-                (String::from("int"), q::Value::Int(q::Number::from(5))),
+                (String::from("int"), r::Value::Int(5)),
             ]
             .into_iter(),
         ));

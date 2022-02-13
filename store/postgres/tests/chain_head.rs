@@ -4,7 +4,9 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use graph::prelude::web3::types::H256;
 use graph::prelude::{anyhow::anyhow, anyhow::Error};
+use graph::prelude::{serde_json as json, EthereumBlock};
 use graph::prelude::{BlockNumber, QueryStoreManager};
 use graph::{cheap_clone::CheapClone, prelude::web3::types::H160};
 use graph::{components::store::BlockStore as _, prelude::DeploymentHash};
@@ -13,8 +15,9 @@ use graph_store_postgres::Store as DieselStore;
 use graph_store_postgres::{layout_for_tests::FAKE_NETWORK_SHARED, ChainStore as DieselChainStore};
 
 use test_store::block_store::{
-    Chain, FakeBlock, BLOCK_FIVE, BLOCK_FOUR, BLOCK_ONE, BLOCK_ONE_NO_PARENT, BLOCK_ONE_SIBLING,
-    BLOCK_THREE, BLOCK_THREE_NO_PARENT, BLOCK_TWO, BLOCK_TWO_NO_PARENT, GENESIS_BLOCK, NO_PARENT,
+    FakeBlock, FakeBlockList, BLOCK_FIVE, BLOCK_FOUR, BLOCK_ONE, BLOCK_ONE_NO_PARENT,
+    BLOCK_ONE_SIBLING, BLOCK_THREE, BLOCK_THREE_NO_PARENT, BLOCK_TWO, BLOCK_TWO_NO_PARENT,
+    GENESIS_BLOCK, NO_PARENT,
 };
 use test_store::*;
 
@@ -23,44 +26,38 @@ use test_store::*;
 const ANCESTOR_COUNT: BlockNumber = 3;
 
 /// Test harness for running database integration tests.
-fn run_test<F>(chain: Chain, test: F)
+fn run_test<F>(chain: FakeBlockList, test: F)
 where
     F: Fn(Arc<DieselChainStore>, Arc<DieselStore>) -> Result<(), Error> + Send + 'static,
 {
-    run_test_sequentially(
-        || (),
-        |store, ()| async move {
-            for name in vec![NETWORK_NAME, FAKE_NETWORK_SHARED] {
-                block_store::set_chain(chain.clone(), name);
+    run_test_sequentially(|store| async move {
+        for name in vec![NETWORK_NAME, FAKE_NETWORK_SHARED] {
+            block_store::set_chain(chain.clone(), name);
 
-                let chain_store = store.block_store().chain_store(name).expect("chain store");
+            let chain_store = store.block_store().chain_store(name).expect("chain store");
 
-                // Run test
-                test(chain_store.cheap_clone(), store.cheap_clone())
-                    .expect(&format!("test finishes successfully on network {}", name));
-            }
-        },
-    );
+            // Run test
+            test(chain_store.cheap_clone(), store.cheap_clone())
+                .expect(&format!("test finishes successfully on network {}", name));
+        }
+    });
 }
 
-fn run_test_async<R, F>(chain: Chain, test: F)
+fn run_test_async<R, F>(chain: FakeBlockList, test: F)
 where
     F: Fn(Arc<DieselChainStore>, Arc<DieselStore>) -> R + Send + Sync + 'static,
     R: Future<Output = ()> + Send + 'static,
 {
-    run_test_sequentially(
-        || (),
-        |store, ()| async move {
-            for name in vec![NETWORK_NAME, FAKE_NETWORK_SHARED] {
-                block_store::set_chain(chain.clone(), name);
+    run_test_sequentially(|store| async move {
+        for name in vec![NETWORK_NAME, FAKE_NETWORK_SHARED] {
+            block_store::set_chain(chain.clone(), name);
 
-                let chain_store = store.block_store().chain_store(name).expect("chain store");
+            let chain_store = store.block_store().chain_store(name).expect("chain store");
 
-                // Run test
-                test(chain_store.cheap_clone(), store.clone()).await;
-            }
-        },
-    );
+            // Run test
+            test(chain_store.cheap_clone(), store.clone()).await;
+        }
+    });
 }
 
 /// Check that `attempt_chain_head_update` works as expected on the given
@@ -69,7 +66,7 @@ where
 /// is the one indicated in `head_exp`. If `missing` is not `None`, check that
 /// `attempt_chain_head_update` reports that block as missing
 fn check_chain_head_update(
-    chain: Chain,
+    chain: FakeBlockList,
     head_exp: Option<&'static FakeBlock>,
     missing: Option<&'static str>,
 ) {
@@ -254,6 +251,8 @@ fn check_ancestor(
 ) -> Result<(), Error> {
     let act = store
         .ancestor_block(child.block_ptr(), offset)?
+        .map(json::from_value::<EthereumBlock>)
+        .transpose()?
         .ok_or_else(|| anyhow!("block {} has no ancestor at offset {}", child.hash, offset))?;
     let act_hash = format!("{:x}", act.block.hash.unwrap());
     let exp_hash = &exp.hash;
@@ -289,7 +288,7 @@ fn ancestor_block_simple() {
         check_ancestor(&store, &*BLOCK_THREE, 2, &*BLOCK_ONE)?;
 
         for offset in [6, 7, 8, 50].iter() {
-            let offset = offset.clone();
+            let offset = *offset;
             let res = store.ancestor_block(BLOCK_FIVE.block_ptr(), offset);
             assert!(res.is_err());
         }
@@ -358,5 +357,18 @@ fn eth_call_cache() {
         assert_eq!(&new_return_value, ret.as_slice());
 
         Ok(())
+    })
+}
+
+#[test]
+/// Tests only query correctness. No data is involved.
+fn test_transaction_receipts_in_block_function() {
+    let chain = vec![];
+    run_test_async(chain, move |store, _| async move {
+        let receipts = store
+            .transaction_receipts_in_block(&H256::zero())
+            .await
+            .unwrap();
+        assert!(receipts.is_empty())
     })
 }

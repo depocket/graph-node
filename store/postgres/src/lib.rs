@@ -35,6 +35,7 @@ mod deployment;
 mod deployment_store;
 mod detail;
 mod dynds;
+mod fork;
 mod functions;
 mod jobs;
 mod jsonb;
@@ -47,14 +48,16 @@ mod sql_value;
 mod store;
 mod store_events;
 mod subgraph_store;
+pub mod transaction_receipt;
+mod writable;
 
 #[cfg(debug_assertions)]
 pub mod layout_for_tests {
     pub use crate::block_range::*;
     pub use crate::block_store::FAKE_NETWORK_SHARED;
-    pub use crate::chain_store::test_support as chain_support;
+    pub use crate::catalog::set_account_like;
     pub use crate::primary::{
-        make_dummy_site, Connection, Namespace, EVENT_TAP, EVENT_TAP_ENABLED,
+        make_dummy_site, Connection, Mirror, Namespace, EVENT_TAP, EVENT_TAP_ENABLED,
     };
     pub use crate::relational::*;
 }
@@ -64,7 +67,8 @@ pub use self::chain_head_listener::ChainHeadUpdateListener;
 pub use self::chain_store::ChainStore;
 pub use self::detail::DeploymentDetail;
 pub use self::jobs::register as register_jobs;
-pub use self::primary::UnusedDeployment;
+pub use self::notification_listener::NotificationSender;
+pub use self::primary::{db_version, UnusedDeployment};
 pub use self::store::Store;
 pub use self::store_events::SubscriptionManager;
 pub use self::subgraph_store::{unused, DeploymentPlacer, Shard, SubgraphStore, PRIMARY_SHARD};
@@ -73,6 +77,8 @@ pub use self::subgraph_store::{unused, DeploymentPlacer, Shard, SubgraphStore, P
 /// be used in 'normal' graph-node code
 pub mod command_support {
     pub mod catalog {
+        pub use crate::block_store::primary as block_store;
+        pub use crate::catalog::{account_like, set_account_like};
         pub use crate::copy::{copy_state, copy_table_state};
         pub use crate::primary::Connection;
         pub use crate::primary::{
@@ -81,5 +87,5 @@ pub mod command_support {
         };
     }
     pub use crate::primary::Namespace;
-    pub use crate::relational::{Catalog, Column, ColumnType, Layout};
+    pub use crate::relational::{Catalog, Column, ColumnType, Layout, SqlName};
 }

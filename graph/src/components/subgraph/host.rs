@@ -1,5 +1,4 @@
 use std::cmp::PartialEq;
-use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -7,6 +6,8 @@ use anyhow::Error;
 use async_trait::async_trait;
 use futures::sync::mpsc;
 
+use crate::blockchain::TriggerWithHandler;
+use crate::components::store::SubgraphFork;
 use crate::prelude::*;
 use crate::{blockchain::Blockchain, components::subgraph::SharedProofOfIndexing};
 use crate::{components::metrics::HistogramVec, runtime::DeterministicHostError};
@@ -26,7 +27,7 @@ impl From<anyhow::Error> for MappingError {
 
 impl From<DeterministicHostError> for MappingError {
     fn from(value: DeterministicHostError) -> MappingError {
-        MappingError::Unknown(value.0)
+        MappingError::Unknown(value.inner())
     }
 }
 
@@ -48,15 +49,16 @@ pub trait RuntimeHost<C: Blockchain>: Send + Sync + 'static {
         trigger: &C::TriggerData,
         block: Arc<C::Block>,
         logger: &Logger,
-    ) -> Result<Option<C::MappingTrigger>, Error>;
+    ) -> Result<Option<TriggerWithHandler<C>>, Error>;
 
     async fn process_mapping_trigger(
         &self,
         logger: &Logger,
         block_ptr: BlockPtr,
-        trigger: C::MappingTrigger,
+        trigger: TriggerWithHandler<C>,
         state: BlockState<C>,
         proof_of_indexing: SharedProofOfIndexing,
+        debug_fork: &Option<Arc<dyn SubgraphFork>>,
     ) -> Result<BlockState<C>, MappingError>;
 
     /// Block number in which this host was created.
@@ -68,13 +70,6 @@ pub struct HostMetrics {
     handler_execution_time: Box<HistogramVec>,
     host_fn_execution_time: Box<HistogramVec>,
     pub stopwatch: StopwatchMetrics,
-}
-
-impl fmt::Debug for HostMetrics {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // TODO: `HistogramVec` does not implement fmt::Debug, what is the best way to deal with this?
-        write!(f, "HostMetrics {{ }}")
-    }
 }
 
 impl HostMetrics {

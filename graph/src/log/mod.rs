@@ -4,13 +4,13 @@ macro_rules! impl_slog_value {
         impl_slog_value!($T, "{}");
     };
     ($T:ty, $fmt:expr) => {
-        impl ::slog::Value for $T {
+        impl $crate::slog::Value for $T {
             fn serialize(
                 &self,
-                record: &::slog::Record,
-                key: ::slog::Key,
-                serializer: &mut dyn ::slog::Serializer,
-            ) -> ::slog::Result {
+                record: &$crate::slog::Record,
+                key: $crate::slog::Key,
+                serializer: &mut dyn $crate::slog::Serializer,
+            ) -> $crate::slog::Result {
                 format!($fmt, self).serialize(record, key, serializer)
             }
         }
@@ -378,7 +378,7 @@ impl ser::Serializer for KeyValueSerializer {
 fn log_query_timing(kind: &str) -> bool {
     env::var("GRAPH_LOG_QUERY_TIMING")
         .unwrap_or_default()
-        .split(",")
+        .split(',')
         .any(|v| v == kind)
 }
 

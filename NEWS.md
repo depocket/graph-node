@@ -1,20 +1,210 @@
 # NEWS
 
-## next - unreleased
+## Unreleased
+- Gracefully handle syntax errors on fulltext search. Specifically provides information about common use case
+  where whitespace characters were part of the terms.
+- Adds support for Solidity Custom Errors (issue #2577)
+
+## 0.25.0
+
+### Api Version 0.0.6
+This release ships support for API version 0.0.6 in mappings:
+- Added `nonce` field for `Transaction` objects.
+- Added `baseFeePerGas` field for `Block` objects ([EIP-1559](https://eips.ethereum.org/EIPS/eip-1559)).
+
+#### Block Cache Invalidation and Reset
+
+All cached block data must be refetched to account for the new `Block` and `Trasaction`
+struct versions, so this release includes a `graph-node` startup check that will:
+1. Truncate all block cache tables.
+2. Bump the `db_version` value from `2` to `3`.
+
+_(Table truncation is a fast operation and no downtime will occur because of that.)_
+
+
+### Ethereum
+
+- 'Out of gas' errors on contract calls are now considered deterministic errors,
+  so they can be handled by `try_` calls. The gas limit is 50 million.
+
+### Environment Variables
+
+- The `GRAPH_ETH_CALL_GAS` environment is removed to prevent misuse, its value
+  is now hardcoded to 50 million.
+
+### Multiblockchain
+- Initial support for NEAR subgraphs.
+- Added `FirehoseBlockStream` implementation of `BlockStream` (#2716)
+
+### Misc
+- Rust docker image is now based on Debian Buster.
+- Optimizations to the PostgreSQL notification queue.
+- Improve PostgreSQL robustness in multi-sharded setups. (#2815)
+- Added 'networks' to the 'subgraphFeatures' endpoint. (#2826)
+- Check and limit the size of GraphQL query results. (#2845)
+- Allow `_in` and `_not_in` GraphQL filters. (#2841)
+- Add PoI for failed subgraphs. (#2748)
+- Make `graphman rewind` safer to use. (#2879)
+- Add `subgraphErrors` for all GraphQL schemas. (#2894)
+- Add `Graph-Attestable` response header. (#2946)
+- Add support for minimum block constraint in GraphQL queries (`number_gte`) (#2868).
+- Handle revert cases from Hardhat and Ganache (#2984)
+- Fix bug on experimental prefetching optimization feature (#2899)
+
+
+## 0.24.2
+
+This release only adds a fix for an issue where certain GraphQL queries
+could lead to `graph-node` running out of memory even on very large
+systems. This release adds code that checks the size of GraphQL responses
+as they are assembled, and can warn about large responses in the logs
+resp. abort query execution based on the values of the two new environment
+variables `GRAPH_GRAPHQL_WARN_RESULT_SIZE` and
+`GRAPH_GRAPHQL_ERROR_RESULT_SIZE`. It also adds Prometheus metrics
+`query_result_size` and `query_result_max` to track the memory consumption
+of successful GraphQL queries. The unit for the two environment variables
+is bytes, based on an estimate of the memory used by the result; it is best
+to set them after observing the Prometheus metrics for a while to establish
+what constitutes a reasonable limit for them.
+
+We strongly recommend updating to this version as quickly as possible.
+
+## 0.24.1
+
+### Feature Management
+
+This release supports the upcoming Spec Version 0.0.4 that enables subgraph features to be declared in the manifest and
+validated during subgraph deployment
+[#2682](https://github.com/graphprotocol/graph-node/pull/2682)
+[#2746](https://github.com/graphprotocol/graph-node/pull/2746).
+
+> Subgraphs using previous versions are still supported and won't be affected by this change.
+
+#### New Indexer GraphQL query: `subgraphFetaures`
+
+It is now possible to query for the features a subgraph uses given its Qm-hash ID.
+
+For instance, the following query...
+
+```graphql
+{
+  subgraphFeatures(subgraphId: "QmW9ajg2oTyPfdWKyUkxc7cTJejwdyCbRrSivfryTfFe5D") {
+    features
+    errors
+  }
+}
+```
+
+... would produce this result:
+
+```json
+{
+  "data": {
+    "subgraphFeatures": {
+      "errors": [],
+      "features": [
+        "nonFatalErrors",
+        "ipfsOnEthereumContracts"
+      ]
+    }
+  }
+}
+```
+
+Subraphs with any Spec Version can be queried that way.
+
+### Api Version 0.0.5
+
+- Added better error message for null pointers in the runtime [#2780](https://github.com/graphprotocol/graph-node/pull/2780).
+
+### Environment Variables
+
+- When `GETH_ETH_CALL_ERRORS_ENV` is unset, it doesn't make `eth_call` errors to be considered determinsistic anymore [#2784](https://github.com/graphprotocol/graph-node/pull/2784)
+
+### Robustness
+
+- Tolerate a non-primary shard being down during startup [#2727](https://github.com/graphprotocol/graph-node/pull/2727).
+- Check that at least one replica for each shard has a non-zero weight [#2749](https://github.com/graphprotocol/graph-node/pull/2749).
+- Reduce locking for the chain head listener [#2763](https://github.com/graphprotocol/graph-node/pull/2763).
+
+### Logs
+
+- Improve block ingestor error reporting for missing receipts [#2743](https://github.com/graphprotocol/graph-node/pull/2743).
+
+## 0.24.0
+
+### Api Version 0.0.5
+
+This release ships support for API version 0.0.5 in mappings. hIt contains a fix for call handlers
+and the long awaited AssemblyScript version upgrade!
+
+- AssemblyScript upgrade: The mapping runtime is updated to support up-to-date versions of the
+  AssemblyScript compiler. The graph-cli/-ts releases to support this are in alpha, soon they will
+  be released along with a migration guide for subgraphs.
+- Call handlers fix: Call handlers will never be triggered on transactions with a failed status,
+  resolving issue [#2409](https://github.com/graphprotocol/graph-node/issues/2409). Done in [#2511](https://github.com/graphprotocol/graph-node/pull/2511).
+
+### Logs
+- The log `"Skipping handler because the event parameters do not match the event signature."` was downgraded from info to trace level.
+- Some block ingestor error logs were upgrded from debug to info level [#2666](https://github.com/graphprotocol/graph-node/pull/2666).
+
+### Metrics
+- `query_semaphore_wait_ms` is now by shard, and has the `pool` and `shard` labels.
+- `deployment_failed` metric added, it is `1` if the subgraph has failed and `0` otherwise.
+
+### Other
+- Upgrade to tokio 1.0 and futures 0.3 [#2679](https://github.com/graphprotocol/graph-node/pull/2679), the first major contribution by StreamingFast!
+- Support Celo block reward events [#2670](https://github.com/graphprotocol/graph-node/pull/2670).
+- Reduce the maximum WASM stack size and make it configurable [#2719](https://github.com/graphprotocol/graph-node/pull/2719).
+- For robustness, ensure periodic updates to the chain head listener [#2725](https://github.com/graphprotocol/graph-node/pull/2725).
+
+## 0.23.1
+
+- Fix ipfs timeout detection [#2584](https://github.com/graphprotocol/graph-node/pull/2584).
+- Fix discrepancy between a database table and its Diesel model [#2586](https://github.com/graphprotocol/graph-node/pull/2586).
+
+## 0.23.0
+
+The Graph Node internals are being heavily refactored to prepare it for the multichain future.
+In the meantime, here are the changes for this release:
 
 - The `GRAPH_ETH_CALL_BY_NUMBER` environment variable has been removed. Graph Node requires an
-  Ethereum client that support EIP-1898, which all major clients support.
-- Added support for IPFS versions larger than 0.4.
-- Added Ethereum ABI encoding and decoding functionality #2348.
+  Ethereum client that supports EIP-1898, which all major clients support.
+- Added support for IPFS versions larger than 0.4. Several changes to make
+  `graph-node` more tolerant of slow/flaky IPFS nodes.
+- Added Ethereum ABI encoding and decoding functionality [#2348](https://github.com/graphprotocol/graph-node/pull/2348).
+- Experimental support for configuration files, see the documentation [here](https://github.com/graphprotocol/graph-node/blob/master/docs/config.md).
+- Better PoI performance [#2329](https://github.com/graphprotocol/graph-node/pull/2329).
+- Improve grafting performance and robustness by copying in batches [#2293](https://github.com/graphprotocol/graph-node/pull/2293).
+- Subgraph metadata storage has been simplified and reorganized. External
+  tools (e.g., Grafana dashboards) that access the database directly will need to be updated.
+- Ordering in GraphQL queries is now truly reversible
+  [#2214](https://github.com/graphprotocol/graph-node/pull/2214/commits/bc559b8df09a7c24f0d718b76fa670313911a6b1)
+- The `GRAPH_SQL_STATEMENT_TIMEOUT` environment variable can be used to
+  enforce a timeout for individual SQL queries that are run in the course of
+  processing a GraphQL query
+  [#2285](https://github.com/graphprotocol/graph-node/pull/2285)
+- Using `ethereum.call` in mappings in globals is deprecated
+
+### Graphman
+Graphman is a CLI tool to manage your subgraphs. It is now included in the Docker container
+[#2289](https://github.com/graphprotocol/graph-node/pull/2289). And new commands have been added:
+- `graphman copy` can copy subgraphs across DB shards [#2313](https://github.com/graphprotocol/graph-node/pull/2313).
+- `graphman rewind` to rewind a deployment to a given block [#2373](https://github.com/graphprotocol/graph-node/pull/2373).
+- `graphman query` to log info about a GraphQL query [#2206](https://github.com/graphprotocol/graph-node/pull/2206).
+- `graphman create` to create a subgraph name [#2419](https://github.com/graphprotocol/graph-node/pull/2419).
+
+### Metrics
 - The `deployment_blocks_behind` metric has been removed, and a
   `deployment_head` metric has been added. To see how far a deployment is
   behind, use the difference between `ethereum_chain_head_number` and
-  `deployment_head`
+  `deployment_head`.
+- The `trigger_type` label was removed from the metric `deployment_trigger_processing_duration`.
 
 ## 0.22.0
 
 ### Feature: Block store sharding
-This release makes it possible to [shard the block and call cache](./docs/sharding.md) for chain
+This release makes it possible to [shard the block and call cache](./docs/config.md) for chain
 data across multiple independent Postgres databases. **This feature is considered experimental. We
 encourage users to try this out in a test environment, but do not recommend it yet for production
 use.** In particular, the details of how sharding is configured may change in backwards-incompatible
@@ -46,7 +236,7 @@ Various related bug fixes have been made #2121 #2136 #2149 #2160.
 ### Feature: Database sharding
 
 This release makes it possible to [shard subgraph
-storage](./docs/sharding.md) and spread subgraph deployments, and the load
+storage](./docs/config.md) and spread subgraph deployments, and the load
 coming from indexing and querying them across multiple independent Postgres
 databases.
 

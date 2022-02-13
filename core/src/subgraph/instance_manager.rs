@@ -1,47 +1,52 @@
+use super::loader::load_dynamic_data_sources;
+use super::SubgraphInstance;
 use atomic_refcell::AtomicRefCell;
 use fail::fail_point;
-use lazy_static::lazy_static;
-use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
-use tokio::task;
-
+use graph::blockchain::block_stream::{BlockStream, BufferedBlockStream};
+use graph::blockchain::{BlockchainKind, DataSource};
+use graph::data::store::scalar::Bytes;
+use graph::data::subgraph::{UnifiedMappingApiVersion, MAX_SPEC_VERSION};
 use graph::prelude::{SubgraphInstanceManager as SubgraphInstanceManagerTrait, *};
-use graph::util::lfu_cache::LfuCache;
+use graph::util::{backoff::ExponentialBackoff, lfu_cache::LfuCache};
 use graph::{blockchain::block_stream::BlockStreamMetrics, components::store::WritableStore};
 use graph::{blockchain::block_stream::BlockWithTriggers, data::subgraph::SubgraphFeature};
 use graph::{
+    blockchain::NodeCapabilities,
     blockchain::TriggersAdapter,
-    data::subgraph::schema::{SubgraphError, POI_OBJECT},
+    data::subgraph::schema::{SubgraphError, SubgraphHealth, POI_OBJECT},
 };
 use graph::{
     blockchain::{block_stream::BlockStreamEvent, Blockchain, TriggerFilter as _},
-    components::subgraph::{MappingError, ProofOfIndexing, SharedProofOfIndexing},
+    components::subgraph::{CausalityRegion, MappingError, ProofOfIndexing, SharedProofOfIndexing},
 };
 use graph::{
     blockchain::{Block, BlockchainMap},
-    components::store::{DeploymentId, DeploymentLocator, ModificationsAndCache},
+    components::store::{DeploymentId, DeploymentLocator, ModificationsAndCache, SubgraphFork},
 };
-use graph::{components::ethereum::NodeCapabilities, data::store::scalar::Bytes};
-use graph_chain_ethereum::{SubgraphEthRpcMetrics, WrappedBlockFinality};
+use lazy_static::lazy_static;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+use tokio::task;
 
-use super::loader::load_dynamic_data_sources;
-use super::SubgraphInstance;
-use crate::subgraph::registrar::IPFS_SUBGRAPH_LOADING_TIMEOUT;
+const MINUTE: Duration = Duration::from_secs(60);
+
+const BUFFERED_BLOCK_STREAM_SIZE: usize = 100;
+const BUFFERED_FIREHOSE_STREAM_SIZE: usize = 1;
 
 lazy_static! {
-    /// Size limit of the entity LFU cache, in bytes.
-    // Multiplied by 1000 because the env var is in KB.
-    pub static ref ENTITY_CACHE_SIZE: usize = 1000
-        * std::env::var("GRAPH_ENTITY_CACHE_SIZE")
-            .unwrap_or("10000".into())
-            .parse::<usize>()
-            .expect("invalid GRAPH_ENTITY_CACHE_SIZE");
-
     // Keep deterministic errors non-fatal even if the subgraph is pending.
     // Used for testing Graph Node itself.
     pub static ref DISABLE_FAIL_FAST: bool =
         std::env::var("GRAPH_DISABLE_FAIL_FAST").is_ok();
+
+    /// Ceiling for the backoff retry of non-deterministic errors, in seconds.
+    pub static ref SUBGRAPH_ERROR_RETRY_CEIL_SECS: Duration =
+        std::env::var("GRAPH_SUBGRAPH_ERROR_RETRY_CEIL_SECS")
+            .unwrap_or((MINUTE * 30).as_secs().to_string())
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .expect("invalid GRAPH_SUBGRAPH_ERROR_RETRY_CEIL_SECS");
 }
 
 type SharedInstanceKeepAliveMap = Arc<RwLock<HashMap<DeploymentId, CancelGuard>>>;
@@ -50,10 +55,13 @@ struct IndexingInputs<C: Blockchain> {
     deployment: DeploymentLocator,
     features: BTreeSet<SubgraphFeature>,
     start_blocks: Vec<BlockNumber>,
+    stop_block: Option<BlockNumber>,
     store: Arc<dyn WritableStore>,
+    debug_fork: Option<Arc<dyn SubgraphFork>>,
     triggers_adapter: Arc<C::TriggersAdapter>,
     chain: Arc<C>,
     templates: Arc<Vec<C::DataSourceTemplate>>,
+    unified_api_version: UnifiedMappingApiVersion,
 }
 
 struct IndexingState<T: RuntimeHostBuilder<C>, C: Blockchain> {
@@ -65,9 +73,6 @@ struct IndexingState<T: RuntimeHostBuilder<C>, C: Blockchain> {
 }
 
 struct IndexingContext<T: RuntimeHostBuilder<C>, C: Blockchain> {
-    /// Read only inputs that are needed while indexing a subgraph.
-    pub inputs: IndexingInputs<C>,
-
     /// Mutable state that may be modified while indexing a subgraph.
     pub state: IndexingState<T, C>,
 
@@ -77,17 +82,13 @@ struct IndexingContext<T: RuntimeHostBuilder<C>, C: Blockchain> {
     /// Sensors to measure the execution of the subgraph's runtime hosts
     pub host_metrics: Arc<HostMetrics>,
 
-    /// Sensors to measure the execution of eth rpc calls
-    pub ethrpc_metrics: Arc<SubgraphEthRpcMetrics>,
-
     pub block_stream_metrics: Arc<BlockStreamMetrics>,
 }
 
-pub struct SubgraphInstanceManager<C, S, M, H, L> {
+pub struct SubgraphInstanceManager<S, M, L> {
     logger_factory: LoggerFactory,
     subgraph_store: Arc<S>,
-    chains: Arc<BlockchainMap<C>>,
-    host_builder: H,
+    chains: Arc<BlockchainMap>,
     metrics_registry: Arc<M>,
     manager_metrics: SubgraphInstanceManagerMetrics,
     instances: SharedInstanceKeepAliveMap,
@@ -175,52 +176,53 @@ impl SubgraphInstanceMetrics {
 }
 
 #[async_trait]
-impl<C, S, M, H, L> SubgraphInstanceManagerTrait for SubgraphInstanceManager<C, S, M, H, L>
+impl<S, M, L> SubgraphInstanceManagerTrait for SubgraphInstanceManager<S, M, L>
 where
     S: SubgraphStore,
-
-    // ETHDEP: Associated types should be unconstrained
-    C: Blockchain<
-        NodeCapabilities = NodeCapabilities,
-        Block = WrappedBlockFinality,
-        DataSource = graph_chain_ethereum::DataSource,
-        DataSourceTemplate = graph_chain_ethereum::DataSourceTemplate,
-    >,
     M: MetricsRegistry,
-    H: RuntimeHostBuilder<C>,
     L: LinkResolver + Clone,
 {
     async fn start_subgraph(
         self: Arc<Self>,
         loc: DeploymentLocator,
         manifest: serde_yaml::Mapping,
+        stop_block: Option<BlockNumber>,
     ) {
         let logger = self.logger_factory.subgraph_logger(&loc);
+        let err_logger = logger.clone();
+        let instance_manager = self.cheap_clone();
 
+        let subgraph_start_future = async move {
+            match BlockchainKind::from_manifest(&manifest)? {
+                BlockchainKind::Ethereum => {
+                    instance_manager
+                        .start_subgraph_inner::<graph_chain_ethereum::Chain>(
+                            logger, loc, manifest, stop_block,
+                        )
+                        .await
+                }
+
+                BlockchainKind::Near => {
+                    instance_manager
+                        .start_subgraph_inner::<graph_chain_near::Chain>(
+                            logger, loc, manifest, stop_block,
+                        )
+                        .await
+                }
+            }
+        };
         // Perform the actual work of starting the subgraph in a separate
         // task. If the subgraph is a graft or a copy, starting it will
         // perform the actual work of grafting/copying, which can take
         // hours. Running it in the background makes sure the instance
         // manager does not hang because of that work.
         graph::spawn(async move {
-            match Self::start_subgraph_inner(
-                logger.clone(),
-                self.instances.clone(),
-                self.host_builder.clone(),
-                self.subgraph_store.clone(),
-                self.chains.clone(),
-                loc,
-                manifest,
-                self.metrics_registry.cheap_clone(),
-                self.link_resolver.cheap_clone(),
-            )
-            .await
-            {
+            match subgraph_start_future.await {
                 Ok(()) => self.manager_metrics.subgraph_count.inc(),
                 Err(err) => error!(
-                    logger,
+                    err_logger,
                     "Failed to start subgraph";
-                    "error" => format!("{}", err),
+                    "error" => format!("{:#}", err),
                     "code" => LogCode::SubgraphStartFailure
                 ),
             }
@@ -239,45 +241,26 @@ where
     }
 }
 
-impl<C, S, M, H, L> SubgraphInstanceManager<C, S, M, H, L>
+impl<S, M, L> SubgraphInstanceManager<S, M, L>
 where
     S: SubgraphStore,
-
-    // ETHDEP: Associated types should be unconstrained
-    C: Blockchain<
-        NodeCapabilities = NodeCapabilities,
-        Block = WrappedBlockFinality,
-        DataSource = graph_chain_ethereum::DataSource,
-        DataSourceTemplate = graph_chain_ethereum::DataSourceTemplate,
-    >,
     M: MetricsRegistry,
-    H: RuntimeHostBuilder<C>,
     L: LinkResolver + Clone,
 {
     pub fn new(
         logger_factory: &LoggerFactory,
         subgraph_store: Arc<S>,
-        chains: Arc<BlockchainMap<C>>,
-        host_builder: H,
+        chains: Arc<BlockchainMap>,
         metrics_registry: Arc<M>,
         link_resolver: Arc<L>,
     ) -> Self {
         let logger = logger_factory.component_logger("SubgraphInstanceManager", None);
         let logger_factory = logger_factory.with_parent(logger.clone());
 
-        let link_resolver = Arc::new(
-            link_resolver
-                .as_ref()
-                .clone()
-                .with_timeout(*IPFS_SUBGRAPH_LOADING_TIMEOUT)
-                .with_retries(),
-        );
-
         SubgraphInstanceManager {
             logger_factory,
             subgraph_store,
             chains,
-            host_builder,
             manager_metrics: SubgraphInstanceManagerMetrics::new(metrics_registry.cheap_clone()),
             metrics_registry,
             instances: SharedInstanceKeepAliveMap::default(),
@@ -285,18 +268,20 @@ where
         }
     }
 
-    async fn start_subgraph_inner(
+    async fn start_subgraph_inner<C: Blockchain>(
+        self: Arc<Self>,
         logger: Logger,
-        instances: SharedInstanceKeepAliveMap,
-        host_builder: impl RuntimeHostBuilder<C>,
-        store: Arc<dyn SubgraphStore>,
-        chains: Arc<BlockchainMap<C>>,
         deployment: DeploymentLocator,
         manifest: serde_yaml::Mapping,
-        registry: Arc<M>,
-        link_resolver: Arc<L>,
+        stop_block: Option<BlockNumber>,
     ) -> Result<(), Error> {
-        let store = store.writable(&deployment)?;
+        let subgraph_store = self.subgraph_store.cheap_clone();
+        let registry = self.metrics_registry.cheap_clone();
+        let store = self
+            .subgraph_store
+            .cheap_clone()
+            .writable(logger.clone(), deployment.id)
+            .await?;
 
         // Start the subgraph deployment before reading dynamic data
         // sources; if the subgraph is a graft or a copy, starting it will
@@ -317,21 +302,22 @@ where
             .and_then(|x| x)?;
         }
 
-        let manifest = {
+        let manifest: SubgraphManifest<C> = {
             info!(logger, "Resolve subgraph files using IPFS");
 
             let mut manifest = SubgraphManifest::resolve_from_raw(
                 deployment.hash.cheap_clone(),
                 manifest,
-                &*link_resolver,
+                // Allow for infinite retries for subgraph definition files.
+                &self.link_resolver.as_ref().clone().with_retries(),
                 &logger,
+                MAX_SPEC_VERSION.clone(),
             )
             .await
             .context("Failed to resolve subgraph from IPFS")?;
 
-            let data_sources = load_dynamic_data_sources(
+            let data_sources = load_dynamic_data_sources::<C>(
                 store.clone(),
-                &deployment.hash,
                 logger.clone(),
                 manifest.templates.clone(),
             )
@@ -352,19 +338,14 @@ where
             manifest
         };
 
-        let required_capabilities = manifest.required_ethereum_capabilities();
+        let required_capabilities = C::NodeCapabilities::from_data_sources(&manifest.data_sources);
         let network = manifest.network_name();
 
-        let chain = chains
-            .get(&network)
+        let chain = self
+            .chains
+            .get::<C>(network.clone())
             .with_context(|| format!("no chain configured for network {}", network))?
             .clone();
-
-        let triggers_adapter = chain.triggers_adapter(&deployment, &required_capabilities).map_err(|e|
-                anyhow!(
-                "expected triggers adapter that matches deployment {} with required capabilities: {}: {}",
-                &deployment,
-                &required_capabilities, e))?.clone();
 
         // Obtain filters from the manifest
         let filter = C::TriggerFilter::from_data_sources(manifest.data_sources.iter());
@@ -372,64 +353,84 @@ where
 
         let templates = Arc::new(manifest.templates.clone());
 
+        // Obtain the debug fork from the subgraph store
+        let debug_fork = self
+            .subgraph_store
+            .debug_fork(&deployment.hash, logger.clone())?;
+
         // Create a subgraph instance from the manifest; this moves
         // ownership of the manifest and host builder into the new instance
-        let stopwatch_metrics =
-            StopwatchMetrics::new(logger.clone(), deployment.hash.clone(), registry.clone());
+        let stopwatch_metrics = StopwatchMetrics::new(
+            logger.clone(),
+            deployment.hash.clone(),
+            self.metrics_registry.clone(),
+        );
+
+        let unified_mapping_api_version = manifest.unified_mapping_api_version()?;
+        let triggers_adapter = chain.triggers_adapter(&deployment, &required_capabilities, unified_mapping_api_version ,stopwatch_metrics.clone()).map_err(|e|
+                anyhow!(
+                "expected triggers adapter that matches deployment {} with required capabilities: {}: {}",
+                &deployment,
+                &required_capabilities, e))?.clone();
+
         let subgraph_metrics = Arc::new(SubgraphInstanceMetrics::new(
-            registry.clone(),
+            registry.cheap_clone(),
             deployment.hash.as_str(),
         ));
         let subgraph_metrics_unregister = subgraph_metrics.clone();
         let host_metrics = Arc::new(HostMetrics::new(
-            registry.clone(),
+            registry.cheap_clone(),
             deployment.hash.as_str(),
             stopwatch_metrics.clone(),
         ));
-        let ethrpc_metrics = Arc::new(SubgraphEthRpcMetrics::new(
-            registry.clone(),
-            &deployment.hash,
-        ));
         let block_stream_metrics = Arc::new(BlockStreamMetrics::new(
-            registry.clone(),
+            registry.cheap_clone(),
             &deployment.hash,
             manifest.network_name(),
+            store.shard().to_string(),
             stopwatch_metrics,
         ));
+
         // Initialize deployment_head with current deployment head. Any sort of trouble in
         // getting the deployment head ptr leads to initializing with 0
-        let deployment_head = store
-            .block_ptr()
-            .ok()
-            .and_then(|ptr| ptr.map(|ptr| ptr.number))
-            .unwrap_or(0) as f64;
+        let deployment_head = store.block_ptr().map(|ptr| ptr.number).unwrap_or(0) as f64;
         block_stream_metrics.deployment_head.set(deployment_head);
 
+        let host_builder = graph_runtime_wasm::RuntimeHostBuilder::new(
+            chain.runtime_adapter(),
+            self.link_resolver.cheap_clone(),
+            subgraph_store.ens_lookup(),
+        );
+
         let features = manifest.features.clone();
+        let unified_api_version = manifest.unified_mapping_api_version()?;
         let instance =
             SubgraphInstance::from_manifest(&logger, manifest, host_builder, host_metrics.clone())?;
 
+        let inputs = IndexingInputs {
+            deployment: deployment.clone(),
+            features,
+            start_blocks,
+            stop_block,
+            store,
+            debug_fork,
+            triggers_adapter,
+            chain,
+            templates,
+            unified_api_version,
+        };
+
         // The subgraph state tracks the state of the subgraph instance over time
         let ctx = IndexingContext {
-            inputs: IndexingInputs {
-                deployment: deployment.clone(),
-                features,
-                start_blocks,
-                store,
-                triggers_adapter,
-                chain,
-                templates,
-            },
             state: IndexingState {
                 logger: logger.cheap_clone(),
                 instance,
-                instances,
+                instances: self.instances.cheap_clone(),
                 filter,
                 entity_lfu_cache: LfuCache::new(),
             },
             subgraph_metrics,
             host_metrics,
-            ethrpc_metrics,
             block_stream_metrics,
         };
 
@@ -440,11 +441,14 @@ where
         // forward; this is easier than updating the existing block stream.
         //
         // This is a long-running and unfortunately a blocking future (see #905), so it is run in
-        // its own thread. When upgrading to tokio 1.0 it would be logical to run this with
-        // `task::unconstrained`, since it has a dedicated OS thread so the OS will handle the
-        // preemption.
+        // its own thread. It is also run with `task::unconstrained` because we have seen deadlocks
+        // occur without it, possibly caused by our use of legacy futures and tokio versions in the
+        // codebase and dependencies, which may not play well with the tokio 1.0 cooperative
+        // scheduling. It is also logical in terms of performance to run this with `unconstrained`,
+        // it has a dedicated OS thread so the OS will handle the preemption. See
+        // https://github.com/tokio-rs/tokio/issues/3493.
         graph::spawn_thread(deployment.to_string(), move || {
-            if let Err(e) = graph::block_on(run_subgraph(ctx)) {
+            if let Err(e) = graph::block_on(task::unconstrained(run_subgraph(ctx, inputs))) {
                 error!(
                     &logger,
                     "Subgraph instance failed to run: {}",
@@ -458,39 +462,86 @@ where
     }
 }
 
-async fn run_subgraph<T, C>(mut ctx: IndexingContext<T, C>) -> Result<(), Error>
+async fn new_block_stream<C: Blockchain>(
+    inputs: Arc<IndexingInputs<C>>,
+    filter: C::TriggerFilter,
+    block_stream_metrics: Arc<BlockStreamMetrics>,
+) -> Result<Box<dyn BlockStream<C>>, Error> {
+    let chain = inputs.chain.cheap_clone();
+    let is_firehose = chain.is_firehose_supported();
+
+    let buffer_size = match is_firehose {
+        true => BUFFERED_FIREHOSE_STREAM_SIZE,
+        false => BUFFERED_BLOCK_STREAM_SIZE,
+    };
+
+    let block_stream = match is_firehose {
+        true => chain.new_firehose_block_stream(
+            inputs.deployment.clone(),
+            inputs.store.block_cursor(),
+            inputs.start_blocks.clone(),
+            Arc::new(filter.clone()),
+            block_stream_metrics.clone(),
+            inputs.unified_api_version.clone(),
+        ),
+        false => {
+            let current_ptr = inputs.store.block_ptr();
+
+            chain.new_polling_block_stream(
+                inputs.deployment.clone(),
+                inputs.start_blocks.clone(),
+                current_ptr,
+                Arc::new(filter.clone()),
+                block_stream_metrics.clone(),
+                inputs.unified_api_version.clone(),
+            )
+        }
+    }
+    .await?;
+
+    Ok(BufferedBlockStream::spawn_from_stream(
+        block_stream,
+        buffer_size,
+    ))
+}
+
+async fn run_subgraph<T, C>(
+    mut ctx: IndexingContext<T, C>,
+    inputs: IndexingInputs<C>,
+) -> Result<(), Error>
 where
     T: RuntimeHostBuilder<C>,
-    C: Blockchain<
-        Block = WrappedBlockFinality,
-        DataSource = graph_chain_ethereum::DataSource,
-        DataSourceTemplate = graph_chain_ethereum::DataSourceTemplate,
-    >,
+    C: Blockchain,
 {
     // Clone a few things for different parts of the async processing
+    let inputs = Arc::new(inputs);
     let subgraph_metrics = ctx.subgraph_metrics.cheap_clone();
-    let store_for_err = ctx.inputs.store.cheap_clone();
+    let store_for_err = inputs.store.cheap_clone();
     let logger = ctx.state.logger.cheap_clone();
-    let id_for_err = ctx.inputs.deployment.hash.clone();
-    let mut first_run = true;
+    let id_for_err = inputs.deployment.hash.clone();
+    let mut should_try_unfail_deterministic = true;
+    let mut should_try_unfail_non_deterministic = true;
+    let mut synced = false;
+
+    // Exponential backoff that starts with two minutes and keeps
+    // increasing its timeout exponentially until it reaches the ceiling.
+    let mut backoff = ExponentialBackoff::new(MINUTE * 2, *SUBGRAPH_ERROR_RETRY_CEIL_SECS);
 
     loop {
         debug!(logger, "Starting or restarting subgraph");
 
         let block_stream_canceler = CancelGuard::new();
         let block_stream_cancel_handle = block_stream_canceler.handle();
-        let mut block_stream = ctx
-            .inputs
-            .chain
-            .new_block_stream(
-                ctx.inputs.deployment.clone(),
-                ctx.inputs.start_blocks.clone(),
-                ctx.state.filter.clone(),
-                ctx.block_stream_metrics.clone(),
-            )?
+
+        let metrics = ctx.block_stream_metrics.clone();
+        let filter = ctx.state.filter.clone();
+        let stream_inputs = inputs.clone();
+        let mut block_stream = new_block_stream(stream_inputs, filter, metrics.cheap_clone())
+            .await?
             .map_err(CancelableError::Error)
-            .cancelable(&block_stream_canceler, || CancelableError::Cancel)
-            .compat();
+            .cancelable(&block_stream_canceler, || Err(CancelableError::Cancel));
+        let chain = inputs.chain.clone();
+        let chain_store = chain.chain_store();
 
         // Keep the stream's cancel guard around to be able to shut it down
         // when the subgraph deployment is unassigned
@@ -498,15 +549,21 @@ where
             .instances
             .write()
             .unwrap()
-            .insert(ctx.inputs.deployment.id, block_stream_canceler);
+            .insert(inputs.deployment.id, block_stream_canceler);
 
         debug!(logger, "Starting block stream");
 
         // Process events from the stream as long as no restart is needed
         loop {
-            let block = match block_stream.next().await {
-                Some(Ok(BlockStreamEvent::ProcessBlock(block))) => block,
-                Some(Ok(BlockStreamEvent::Revert(subgraph_ptr))) => {
+            let event = {
+                let _section = metrics.stopwatch.start_section("scan_blocks");
+
+                block_stream.next().await
+            };
+
+            let (block, cursor) = match event {
+                Some(Ok(BlockStreamEvent::ProcessBlock(block, cursor))) => (block, cursor),
+                Some(Ok(BlockStreamEvent::Revert(subgraph_ptr, parent_ptr, cursor))) => {
                     info!(
                         logger,
                         "Reverting block to get back to main chain";
@@ -514,31 +571,20 @@ where
                         "block_hash" => format!("{}", subgraph_ptr.hash)
                     );
 
-                    // We would like to revert the DB state to the parent of the current block.
-                    // First, load the block in order to get the parent hash.
-                    if let Err(e) = ctx
-                        .inputs
-                        .triggers_adapter
-                        .parent_ptr(&subgraph_ptr)
-                        .await
-                        .and_then(|parent_ptr| {
-                            // Revert entity changes from this block, and update subgraph ptr.
-                            ctx.inputs
-                                .store
-                                .revert_block_operations(parent_ptr)
-                                .map_err(Into::into)
-                        })
+                    if let Err(e) = inputs
+                        .store
+                        .revert_block_operations(parent_ptr, cursor.as_deref())
                     {
-                        debug!(
+                        error!(
                             &logger,
-                            "Could not revert block. \
-                            The likely cause is the block not being found due to a deep reorg. \
-                            Retrying";
+                            "Could not revert block. Retrying";
                             "block_number" => format!("{}", subgraph_ptr.number),
                             "block_hash" => format!("{}", subgraph_ptr.hash),
                             "error" => e.to_string(),
                         );
-                        continue;
+
+                        // Exit inner block stream consumption loop and go up to loop that restarts subgraph
+                        break;
                     }
 
                     ctx.block_stream_metrics
@@ -557,9 +603,15 @@ where
                     ctx.state.entity_lfu_cache = LfuCache::new();
                     continue;
                 }
+
                 // Log and drop the errors from the block_stream
                 // The block stream will continue attempting to produce blocks
                 Some(Err(e)) => {
+                    if block_stream_cancel_handle.is_canceled() {
+                        debug!(&logger, "Subgraph block stream shut down cleanly");
+                        return Ok(());
+                    }
+
                     debug!(
                         &logger,
                         "Block stream produced a non-fatal error";
@@ -567,6 +619,7 @@ where
                     );
                     continue;
                 }
+                // Scenario where this can happen: 1504c9d8-36e4-45bb-b4f2-71cf58789ed9
                 None => unreachable!("The block stream stopped producing blocks"),
             };
 
@@ -579,13 +632,41 @@ where
             }
 
             let start = Instant::now();
+            let deployment_failed = ctx.block_stream_metrics.deployment_failed.clone();
+
+            // If a subgraph failed for deterministic reasons, before processing a new block, we
+            // revert the deployment head. It should lead to the same result since the error was
+            // deterministic.
+            //
+            // As an optimization we check this only on the first run.
+            if should_try_unfail_deterministic {
+                should_try_unfail_deterministic = false;
+
+                if let Some(current_ptr) = inputs.store.block_ptr() {
+                    if let Some(parent_ptr) =
+                        inputs.triggers_adapter.parent_ptr(&current_ptr).await?
+                    {
+                        // This reverts the deployment head to the parent_ptr if
+                        // deterministic errors happened.
+                        //
+                        // There's no point in calling it if we have no current or parent block
+                        // pointers, because there would be: no block to revert to or to search
+                        // errors from (first execution).
+                        inputs
+                            .store
+                            .unfail_deterministic_error(&current_ptr, &parent_ptr)?;
+                    }
+                }
+            }
 
             let res = process_block(
                 &logger,
-                ctx.inputs.triggers_adapter.cheap_clone(),
-                ctx,
+                inputs.triggers_adapter.cheap_clone(),
+                &mut ctx,
+                &inputs,
                 block_stream_cancel_handle.clone(),
                 block,
+                cursor.into(),
             )
             .await;
 
@@ -593,15 +674,41 @@ where
             subgraph_metrics.block_processing_duration.observe(elapsed);
 
             match res {
-                Ok((c, needs_restart)) => {
-                    ctx = c;
+                Ok(needs_restart) => {
+                    // Once synced, no need to try to update the status again.
+                    if !synced && is_deployment_synced(&block_ptr, chain_store.cached_head_ptr()?) {
+                        // Updating the sync status is an one way operation.
+                        // This state change exists: not synced -> synced
+                        // This state change does NOT: synced -> not synced
+                        inputs.store.deployment_synced()?;
 
-                    // Unfail the subgraph if it was previously failed.
-                    // As an optimization we check this only on the first run.
-                    if first_run {
-                        first_run = false;
+                        // Stop trying to update the sync status.
+                        synced = true;
 
-                        ctx.inputs.store.unfail()?;
+                        // Stop recording time-to-sync metrics.
+                        ctx.block_stream_metrics.stopwatch.disable();
+                    }
+
+                    // Keep trying to unfail subgraph for everytime it advances block(s) until it's
+                    // health is not Failed anymore.
+                    if should_try_unfail_non_deterministic {
+                        // If the deployment head advanced, we can unfail
+                        // the non-deterministic error (if there's any).
+                        inputs.store.unfail_non_deterministic_error(&block_ptr)?;
+
+                        match inputs.store.health(&inputs.deployment.hash).await? {
+                            SubgraphHealth::Failed => {
+                                // If the unfail call didn't change the subgraph health, we keep
+                                // `should_try_unfail_non_deterministic` as `true` until it's
+                                // actually unfailed.
+                            }
+                            SubgraphHealth::Healthy | SubgraphHealth::Unhealthy => {
+                                // Stop trying to unfail.
+                                should_try_unfail_non_deterministic = false;
+                                deployment_failed.set(0.0);
+                                backoff.reset();
+                            }
+                        };
                     }
 
                     if needs_restart {
@@ -610,40 +717,103 @@ where
                             .instances
                             .write()
                             .unwrap()
-                            .remove(&ctx.inputs.deployment.id);
+                            .remove(&inputs.deployment.id);
 
                         // And restart the subgraph
                         break;
                     }
+
+                    if let Some(stop_block) = &inputs.stop_block {
+                        if block_ptr.number >= *stop_block {
+                            info!(&logger, "stop block reached for subgraph");
+                            return Ok(());
+                        }
+                    }
                 }
                 Err(BlockProcessingError::Canceled) => {
-                    debug!(
-                        &logger,
-                        "Subgraph block stream shut down cleanly";
-                        "id" => id_for_err.to_string(),
-                    );
+                    debug!(&logger, "Subgraph block stream shut down cleanly");
                     return Ok(());
                 }
 
                 // Handle unexpected stream errors by marking the subgraph as failed.
                 Err(e) => {
+                    // Clear entity cache when a subgraph fails.
+                    //
+                    // This is done to be safe and sure that there's no state that's
+                    // out of sync from the database.
+                    //
+                    // Without it, POI changes on failure would be kept in the entity cache
+                    // and be transacted incorrectly in the next run.
+                    ctx.state.entity_lfu_cache = LfuCache::new();
+
+                    deployment_failed.set(1.0);
+
                     let message = format!("{:#}", e).replace("\n", "\t");
                     let err = anyhow!("{}, code: {}", message, LogCode::SubgraphSyncingFailure);
+                    let deterministic = e.is_deterministic();
 
                     let error = SubgraphError {
                         subgraph_id: id_for_err.clone(),
                         message,
                         block_ptr: Some(block_ptr),
                         handler: None,
-                        deterministic: e.is_deterministic(),
+                        deterministic,
                     };
 
-                    store_for_err
-                        .fail_subgraph(error)
-                        .await
-                        .context("Failed to set subgraph status to `failed`")?;
+                    match deterministic {
+                        true => {
+                            // Fail subgraph:
+                            // - Change status/health.
+                            // - Save the error to the database.
+                            store_for_err
+                                .fail_subgraph(error)
+                                .await
+                                .context("Failed to set subgraph status to `failed`")?;
 
-                    return Err(err);
+                            return Err(err);
+                        }
+                        false => {
+                            // Shouldn't fail subgraph if it's already failed for non-deterministic
+                            // reasons.
+                            //
+                            // If we don't do this check we would keep adding the same error to the
+                            // database.
+                            let should_fail_subgraph =
+                                inputs.store.health(&inputs.deployment.hash).await?
+                                    != SubgraphHealth::Failed;
+
+                            if should_fail_subgraph {
+                                // Fail subgraph:
+                                // - Change status/health.
+                                // - Save the error to the database.
+                                store_for_err
+                                    .fail_subgraph(error)
+                                    .await
+                                    .context("Failed to set subgraph status to `failed`")?;
+                            }
+
+                            // Retry logic below:
+
+                            // Cancel the stream for real.
+                            ctx.state
+                                .instances
+                                .write()
+                                .unwrap()
+                                .remove(&inputs.deployment.id);
+
+                            error!(logger, "Subgraph failed with non-deterministic error: {}", e;
+                                "attempt" => backoff.attempt,
+                                "retry_delay_s" => backoff.delay().as_secs());
+
+                            // Sleep before restarting.
+                            backoff.sleep_async().await;
+
+                            should_try_unfail_non_deterministic = true;
+
+                            // And restart the subgraph.
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -676,21 +846,23 @@ impl From<Error> for BlockProcessingError {
     }
 }
 
+impl From<StoreError> for BlockProcessingError {
+    fn from(e: StoreError) -> Self {
+        BlockProcessingError::Unknown(e.into())
+    }
+}
+
 /// Processes a block and returns the updated context and a boolean flag indicating
 /// whether new dynamic data sources have been added to the subgraph.
-async fn process_block<T: RuntimeHostBuilder<C>, C>(
+async fn process_block<T: RuntimeHostBuilder<C>, C: Blockchain>(
     logger: &Logger,
     triggers_adapter: Arc<C::TriggersAdapter>,
-    mut ctx: IndexingContext<T, C>,
+    ctx: &mut IndexingContext<T, C>,
+    inputs: &IndexingInputs<C>,
     block_stream_cancel_handle: CancelHandle,
     block: BlockWithTriggers<C>,
-) -> Result<(IndexingContext<T, C>, bool), BlockProcessingError>
-where
-    C: Blockchain<
-        DataSource = graph_chain_ethereum::DataSource,
-        DataSourceTemplate = graph_chain_ethereum::DataSourceTemplate,
-    >,
-{
+    firehose_cursor: Option<String>,
+) -> Result<bool, BlockProcessingError> {
     let triggers = block.trigger_data;
     let block = Arc::new(block.block);
     let block_ptr = block.ptr();
@@ -701,24 +873,18 @@ where
     ));
 
     if triggers.len() == 1 {
-        info!(&logger, "1 trigger found in this block for this subgraph");
+        debug!(&logger, "1 candidate trigger in this block");
     } else if triggers.len() > 1 {
-        info!(
+        debug!(
             &logger,
-            "{} triggers found in this block for this subgraph",
+            "{} candidate triggers in this block",
             triggers.len()
         );
     }
 
     let metrics = ctx.subgraph_metrics.clone();
 
-    let proof_of_indexing = if ctx
-        .inputs
-        .store
-        .clone()
-        .supports_proof_of_indexing()
-        .await?
-    {
+    let proof_of_indexing = if inputs.store.clone().supports_proof_of_indexing().await? {
         Some(Arc::new(AtomicRefCell::new(ProofOfIndexing::new(
             block_ptr.number,
         ))))
@@ -726,12 +892,15 @@ where
         None
     };
 
+    // There are currently no other causality regions since offchain data is not supported.
+    let causality_region = CausalityRegion::from_network(ctx.state.instance.network());
+
     // Process events one after the other, passing in entity operations
     // collected previously to every new event being processed
     let mut block_state = match process_triggers(
         &logger,
         BlockState::new(
-            ctx.inputs.store.clone(),
+            inputs.store.clone(),
             std::mem::take(&mut ctx.state.entity_lfu_cache),
         ),
         proof_of_indexing.cheap_clone(),
@@ -739,19 +908,20 @@ where
         &ctx.state.instance,
         &block,
         triggers,
+        &causality_region,
+        &inputs.debug_fork,
     )
     .await
     {
-        // Triggers processed with no errors or with only determinstic errors.
+        // Triggers processed with no errors or with only deterministic errors.
         Ok(block_state) => block_state,
 
         // Some form of unknown or non-deterministic error ocurred.
         Err(MappingError::Unknown(e)) => return Err(BlockProcessingError::Unknown(e)),
         Err(MappingError::PossibleReorg(e)) => {
-            info!(ctx.state.logger,
+            info!(logger,
                     "Possible reorg detected, retrying";
                     "error" => format!("{:#}", e),
-                    "id" => ctx.inputs.deployment.hash.to_string(),
             );
 
             // In case of a possible reorg, we want this function to do nothing and restart the
@@ -761,7 +931,7 @@ where
             // Losing the cache is a bit annoying but not an issue for correctness.
             //
             // See also b21fa73b-6453-4340-99fb-1a78ec62efb1.
-            return Ok((ctx, true));
+            return Ok(true);
         }
     };
 
@@ -782,7 +952,8 @@ where
         // Instantiate dynamic data sources, removing them from the block state.
         let (data_sources, runtime_hosts) = create_dynamic_data_sources(
             logger.clone(),
-            &mut ctx,
+            ctx,
+            &inputs,
             host_metrics.clone(),
             block_state.drain_created_data_sources(),
         )?;
@@ -813,7 +984,7 @@ where
         // and add runtimes for the data sources to the subgraph instance.
         persist_dynamic_data_sources(
             logger.clone(),
-            &mut ctx,
+            ctx,
             &mut block_state.entity_cache,
             data_sources,
         );
@@ -828,6 +999,8 @@ where
                 &trigger,
                 block_state,
                 proof_of_indexing.cheap_clone(),
+                &causality_region,
+                &inputs.debug_fork,
             )
             .await
             .map_err(|e| {
@@ -844,20 +1017,8 @@ where
         }
     }
 
-    // The triggers were processed but some were skipped due to deterministic errors, if the
-    // `nonFatalErrors` feature is not present, return early with an error.
     let has_errors = block_state.has_errors();
-    if has_errors
-        && !ctx
-            .inputs
-            .features
-            .contains(&SubgraphFeature::nonFatalErrors)
-    {
-        // Take just the first error to report.
-        return Err(BlockProcessingError::Deterministic(
-            block_state.deterministic_errors.into_iter().next().unwrap(),
-        ));
-    }
+    let is_non_fatal_errors_active = inputs.features.contains(&SubgraphFeature::NonFatalErrors);
 
     // Apply entity operations and advance the stream
 
@@ -871,7 +1032,7 @@ where
         update_proof_of_indexing(
             proof_of_indexing,
             &ctx.host_metrics.stopwatch,
-            &ctx.inputs.deployment.hash,
+            &inputs.deployment.hash,
             &mut block_state.entity_cache,
         )
         .await?;
@@ -879,20 +1040,13 @@ where
 
     let section = ctx.host_metrics.stopwatch.start_section("as_modifications");
     let ModificationsAndCache {
-        modifications: mods,
+        modifications: mut mods,
         data_sources,
-        entity_lfu_cache: mut cache,
+        entity_lfu_cache: cache,
     } = block_state
         .entity_cache
         .as_modifications()
         .map_err(|e| BlockProcessingError::Unknown(e.into()))?;
-    section.end();
-
-    let section = ctx
-        .host_metrics
-        .stopwatch
-        .start_section("entity_cache_evict");
-    cache.evict(*ENTITY_CACHE_SIZE);
     section.end();
 
     // Put the cache back in the ctx, asserting that the placeholder cache was not used.
@@ -918,28 +1072,54 @@ where
     let stopwatch = ctx.host_metrics.stopwatch.clone();
     let start = Instant::now();
 
-    let store = &ctx.inputs.store;
-    let fail_fast = || -> Result<bool, BlockProcessingError> {
-        Ok(!*DISABLE_FAIL_FAST
-            && !store
-                .is_deployment_synced()
-                .map_err(BlockProcessingError::Unknown)?)
-    };
+    let store = &inputs.store;
 
-    match ctx.inputs.store.transact_block_operations(
+    // If a deterministic error has happened, make the PoI to be the only entity that'll be stored.
+    if has_errors && !is_non_fatal_errors_active {
+        let is_poi_entity =
+            |entity_mod: &EntityModification| entity_mod.entity_key().entity_type.is_poi();
+        mods.retain(is_poi_entity);
+        // Confidence check
+        assert!(
+            mods.len() == 1,
+            "There should be only one PoI EntityModification"
+        );
+    }
+
+    let BlockState {
+        deterministic_errors,
+        ..
+    } = block_state;
+
+    let first_error = deterministic_errors.first().cloned();
+
+    match store.transact_block_operations(
         block_ptr,
+        firehose_cursor,
         mods,
         stopwatch,
         data_sources,
-        block_state.deterministic_errors,
+        deterministic_errors,
     ) {
         Ok(_) => {
+            // For subgraphs with `nonFatalErrors` feature disabled, we consider
+            // any error as fatal.
+            //
+            // So we do an early return to make the subgraph stop processing blocks.
+            //
+            // In this scenario the only entity that is stored/transacted is the PoI,
+            // all of the others are discarded.
+            if has_errors && !is_non_fatal_errors_active {
+                // Only the first error is reported.
+                return Err(BlockProcessingError::Deterministic(first_error.unwrap()));
+            }
+
             let elapsed = start.elapsed().as_secs_f64();
             metrics.block_ops_transaction_duration.observe(elapsed);
 
             // To prevent a buggy pending version from replacing a current version, if errors are
             // present the subgraph will be unassigned.
-            if has_errors && fail_fast()? {
+            if has_errors && !*DISABLE_FAIL_FAST && !store.is_deployment_synced().await? {
                 store
                     .unassign_subgraph()
                     .map_err(|e| BlockProcessingError::Unknown(e.into()))?;
@@ -949,7 +1129,7 @@ where
                 return Err(BlockProcessingError::Canceled);
             }
 
-            Ok((ctx, needs_restart))
+            Ok(needs_restart)
         }
 
         Err(e) => Err(anyhow!("Error while processing block stream for a subgraph: {}", e).into()),
@@ -997,7 +1177,7 @@ async fn update_proof_of_indexing(
             digest: updated_proof_of_indexing,
         };
 
-        entity_cache.set(entity_key, new_poi_entity);
+        entity_cache.set(entity_key, new_poi_entity)?;
     }
 
     Ok(())
@@ -1011,6 +1191,8 @@ async fn process_triggers<C: Blockchain>(
     instance: &SubgraphInstance<C, impl RuntimeHostBuilder<C>>,
     block: &Arc<C::Block>,
     triggers: Vec<C::TriggerData>,
+    causality_region: &str,
+    debug_fork: &Option<Arc<dyn SubgraphFork>>,
 ) -> Result<BlockState<C>, MappingError> {
     use graph::blockchain::TriggerData;
 
@@ -1023,6 +1205,8 @@ async fn process_triggers<C: Blockchain>(
                 &trigger,
                 block_state,
                 proof_of_indexing.cheap_clone(),
+                causality_region,
+                debug_fork,
             )
             .await
             .map_err(move |mut e| {
@@ -1038,18 +1222,13 @@ async fn process_triggers<C: Blockchain>(
     Ok(block_state)
 }
 
-fn create_dynamic_data_sources<T: RuntimeHostBuilder<C>, C>(
+fn create_dynamic_data_sources<T: RuntimeHostBuilder<C>, C: Blockchain>(
     logger: Logger,
     ctx: &mut IndexingContext<T, C>,
+    inputs: &IndexingInputs<C>,
     host_metrics: Arc<HostMetrics>,
     created_data_sources: Vec<DataSourceTemplateInfo<C>>,
-) -> Result<(Vec<graph_chain_ethereum::DataSource>, Vec<Arc<T::Host>>), Error>
-where
-    C: Blockchain<
-        DataSource = graph_chain_ethereum::DataSource,
-        DataSourceTemplate = graph_chain_ethereum::DataSourceTemplate,
-    >,
-{
+) -> Result<(Vec<C::DataSource>, Vec<Arc<T::Host>>), Error> {
     let mut data_sources = vec![];
     let mut runtime_hosts = vec![];
 
@@ -1061,7 +1240,7 @@ where
         let host = ctx.state.instance.add_dynamic_data_source(
             &logger,
             data_source.clone(),
-            ctx.inputs.templates.clone(),
+            inputs.templates.clone(),
             host_metrics.clone(),
         )?;
 
@@ -1076,11 +1255,10 @@ where
                     logger,
                     "no runtime hosted created, there is already a runtime host instantiated for \
                      this data source";
-                    "name" => &data_source.name,
-                    "address" => &data_source.source.address
-                        .map(|address| address.to_string())
+                    "name" => &data_source.name(),
+                    "address" => &data_source.address()
+                        .map(|address| hex::encode(address))
                         .unwrap_or("none".to_string()),
-                    "abi" => &data_source.source.abi
                 )
             }
         }
@@ -1089,14 +1267,12 @@ where
     Ok((data_sources, runtime_hosts))
 }
 
-fn persist_dynamic_data_sources<T: RuntimeHostBuilder<C>, C>(
+fn persist_dynamic_data_sources<T: RuntimeHostBuilder<C>, C: Blockchain>(
     logger: Logger,
     ctx: &mut IndexingContext<T, C>,
     entity_cache: &mut EntityCache,
-    data_sources: Vec<graph_chain_ethereum::DataSource>,
-) where
-    C: Blockchain<DataSource = graph_chain_ethereum::DataSource>,
-{
+    data_sources: Vec<C::DataSource>,
+) {
     if !data_sources.is_empty() {
         debug!(
             logger,
@@ -1111,12 +1287,44 @@ fn persist_dynamic_data_sources<T: RuntimeHostBuilder<C>, C>(
         debug!(
             logger,
             "Persisting data_source";
-            "name" => &data_source.name,
-            "address" => &data_source.source.address.map(|address| address.to_string()).unwrap_or("none".to_string()),
+            "name" => &data_source.name(),
+            "address" => &data_source.address().map(|address| hex::encode(address)).unwrap_or("none".to_string()),
         );
         entity_cache.add_data_source(data_source);
     }
 
     // Merge filters from data sources into the block stream builder
     ctx.state.filter.extend(data_sources.iter());
+}
+
+/// Checks if the Deployment BlockPtr is at least one block behind to the chain head.
+fn is_deployment_synced(deployment_head_ptr: &BlockPtr, chain_head_ptr: Option<BlockPtr>) -> bool {
+    matches!((deployment_head_ptr, &chain_head_ptr), (b1, Some(b2)) if b1.number >= (b2.number - 1))
+}
+
+#[test]
+fn test_is_deployment_synced() {
+    let block_0 = BlockPtr::try_from((
+        "bd34884280958002c51d3f7b5f853e6febeba33de0f40d15b0363006533c924f",
+        0,
+    ))
+    .unwrap();
+    let block_1 = BlockPtr::try_from((
+        "8511fa04b64657581e3f00e14543c1d522d5d7e771b54aa3060b662ade47da13",
+        1,
+    ))
+    .unwrap();
+    let block_2 = BlockPtr::try_from((
+        "b98fb783b49de5652097a989414c767824dff7e7fd765a63b493772511db81c1",
+        2,
+    ))
+    .unwrap();
+
+    assert!(!is_deployment_synced(&block_0, None));
+    assert!(!is_deployment_synced(&block_2, None));
+
+    assert!(!is_deployment_synced(&block_0, Some(block_2.clone())));
+
+    assert!(is_deployment_synced(&block_1, Some(block_2.clone())));
+    assert!(is_deployment_synced(&block_2, Some(block_2.clone())));
 }

@@ -1,6 +1,7 @@
 use diesel::{dsl::sql, prelude::*};
 use diesel::{sql_types::Text, PgConnection};
 
+use graph::components::store::DeploymentId;
 use graph::{
     components::store::DeploymentLocator,
     data::subgraph::status,
@@ -9,24 +10,32 @@ use graph::{
         DeploymentHash, Error, SubgraphStore as _,
     },
 };
+use graph_store_postgres::connection_pool::ConnectionPool;
 use graph_store_postgres::{command_support::catalog as store_catalog, Shard, SubgraphStore};
 
 use crate::manager::deployment;
 use crate::manager::display::List;
 
-#[derive(Queryable, PartialEq, Eq, Hash)]
+#[derive(Queryable, PartialEq, Eq, Hash, Debug)]
 pub struct Deployment {
     pub name: String,
     pub status: String,
     pub deployment: String,
     pub namespace: String,
+    pub id: i32,
     pub node_id: Option<String>,
     pub shard: String,
     pub chain: String,
+    pub active: bool,
 }
 
 impl Deployment {
-    pub fn lookup(conn: &PgConnection, name: String) -> Result<Vec<Self>, anyhow::Error> {
+    pub fn lookup(primary: &ConnectionPool, name: String) -> Result<Vec<Self>, anyhow::Error> {
+        let conn = primary.get()?;
+        Self::lookup_with_conn(&conn, name)
+    }
+
+    pub fn lookup_with_conn(conn: &PgConnection, name: String) -> Result<Vec<Self>, anyhow::Error> {
         use store_catalog::deployment_schemas as ds;
         use store_catalog::subgraph as s;
         use store_catalog::subgraph_deployment_assignment as a;
@@ -46,9 +55,11 @@ impl Deployment {
                 ),
                 v::deployment,
                 ds::name,
+                ds::id,
                 a::node_id.nullable(),
                 ds::shard,
                 ds::network,
+                ds::active,
             ));
 
         let deployments: Vec<Deployment> = if name.starts_with("sgd") {
@@ -63,6 +74,13 @@ impl Deployment {
         Ok(deployments)
     }
 
+    pub fn locator(&self) -> DeploymentLocator {
+        DeploymentLocator::new(
+            DeploymentId(self.id),
+            DeploymentHash::new(self.deployment.clone()).unwrap(),
+        )
+    }
+
     pub fn print_table(deployments: Vec<Self>, statuses: Vec<status::Info>) {
         let mut rows = vec![
             "name",
@@ -70,6 +88,7 @@ impl Deployment {
             "id",
             "namespace",
             "shard",
+            "active",
             "chain",
             "node_id",
         ];
@@ -82,7 +101,7 @@ impl Deployment {
         for deployment in deployments {
             let status = statuses
                 .iter()
-                .find(|status| &status.subgraph == &deployment.deployment);
+                .find(|status| &status.id.0 == &deployment.id);
 
             let mut rows = vec![
                 deployment.name,
@@ -90,6 +109,7 @@ impl Deployment {
                 deployment.deployment,
                 deployment.namespace,
                 deployment.shard,
+                deployment.active.to_string(),
                 deployment.chain,
                 deployment.node_id.unwrap_or("---".to_string()),
             ];

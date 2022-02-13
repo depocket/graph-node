@@ -8,7 +8,10 @@ use std::str::FromStr;
 use graph::{blockchain::DataSource, prelude::*};
 use graph::{
     blockchain::{Block, Blockchain},
-    components::subgraph::{MappingError, SharedProofOfIndexing},
+    components::{
+        store::SubgraphFork,
+        subgraph::{MappingError, SharedProofOfIndexing},
+    },
 };
 
 lazy_static! {
@@ -80,13 +83,13 @@ where
         host_metrics: Arc<HostMetrics>,
     ) -> Result<T::Host, Error> {
         let mapping_request_sender = {
-            let module_bytes = data_source.mapping().runtime.as_ref();
+            let module_bytes = data_source.runtime();
             let module_hash = tiny_keccak::keccak256(module_bytes);
             if let Some(sender) = self.module_cache.get(&module_hash) {
                 sender.clone()
             } else {
                 let sender = T::spawn_mapping(
-                    module_bytes.clone(),
+                    module_bytes.to_owned(),
                     logger,
                     self.subgraph_id.clone(),
                     host_metrics.clone(),
@@ -112,6 +115,8 @@ where
         trigger: &C::TriggerData,
         state: BlockState<C>,
         proof_of_indexing: SharedProofOfIndexing,
+        causality_region: &str,
+        debug_fork: &Option<Arc<dyn SubgraphFork>>,
     ) -> Result<BlockState<C>, MappingError> {
         Self::process_trigger_in_runtime_hosts(
             logger,
@@ -120,6 +125,8 @@ where
             trigger,
             state,
             proof_of_indexing,
+            causality_region,
+            debug_fork,
         )
         .await
     }
@@ -131,7 +138,17 @@ where
         trigger: &C::TriggerData,
         mut state: BlockState<C>,
         proof_of_indexing: SharedProofOfIndexing,
+        causality_region: &str,
+        debug_fork: &Option<Arc<dyn SubgraphFork>>,
     ) -> Result<BlockState<C>, MappingError> {
+        let error_count = state.deterministic_errors.len();
+
+        if let Some(proof_of_indexing) = &proof_of_indexing {
+            proof_of_indexing
+                .borrow_mut()
+                .start_handler(causality_region);
+        }
+
         for host in hosts {
             let mapping_trigger =
                 match host.match_and_decode(trigger, block.cheap_clone(), logger)? {
@@ -149,8 +166,21 @@ where
                     mapping_trigger,
                     state,
                     proof_of_indexing.cheap_clone(),
+                    debug_fork,
                 )
                 .await?;
+        }
+
+        if let Some(proof_of_indexing) = &proof_of_indexing {
+            if state.deterministic_errors.len() != error_count {
+                assert!(state.deterministic_errors.len() == error_count + 1);
+
+                // If a deterministic error has happened, write a new
+                // ProofOfIndexingEvent::DeterministicError to the SharedProofOfIndexing.
+                proof_of_indexing
+                    .borrow_mut()
+                    .write_deterministic_error(&logger, causality_region);
+            }
         }
 
         Ok(state)
@@ -202,5 +232,9 @@ where
         {
             self.hosts.pop();
         }
+    }
+
+    pub(crate) fn network(&self) -> &str {
+        &self.network
     }
 }

@@ -44,9 +44,8 @@ impl SubgraphHealth {
 
     pub fn is_failed(&self) -> bool {
         match self {
-            SubgraphHealth::Healthy => false,
-            SubgraphHealth::Unhealthy => false,
             SubgraphHealth::Failed => true,
+            SubgraphHealth::Healthy | SubgraphHealth::Unhealthy => false,
         }
     }
 }
@@ -82,10 +81,16 @@ impl From<SubgraphHealth> for q::Value {
     }
 }
 
+impl From<SubgraphHealth> for r::Value {
+    fn from(health: SubgraphHealth) -> r::Value {
+        r::Value::Enum(health.into())
+    }
+}
+
 impl TryFromValue for SubgraphHealth {
-    fn try_from_value(value: &q::Value) -> Result<SubgraphHealth, Error> {
+    fn try_from_value(value: &r::Value) -> Result<SubgraphHealth, Error> {
         match value {
-            q::Value::Enum(health) => SubgraphHealth::from_str(health),
+            r::Value::Enum(health) => SubgraphHealth::from_str(health),
             _ => Err(anyhow!(
                 "cannot parse value as SubgraphHealth: `{:?}`",
                 value
@@ -106,6 +111,7 @@ pub struct SubgraphDeploymentEntity {
     pub latest_block: Option<BlockPtr>,
     pub graft_base: Option<DeploymentHash>,
     pub graft_block: Option<BlockPtr>,
+    pub debug_fork: Option<DeploymentHash>,
     pub reorg_count: i32,
     pub current_reorg_depth: i32,
     pub max_reorg_depth: i32,
@@ -128,6 +134,7 @@ impl SubgraphDeploymentEntity {
             latest_block: earliest_block,
             graft_base: None,
             graft_block: None,
+            debug_fork: None,
             reorg_count: 0,
             current_reorg_depth: 0,
             max_reorg_depth: 0,
@@ -144,6 +151,11 @@ impl SubgraphDeploymentEntity {
         }
         self
     }
+
+    pub fn debug(mut self, fork: Option<DeploymentHash>) -> Self {
+        self.debug_fork = fork;
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -158,7 +170,7 @@ pub struct SubgraphManifestEntity {
 impl<'a, C: Blockchain> From<&'a super::SubgraphManifest<C>> for SubgraphManifestEntity {
     fn from(manifest: &'a super::SubgraphManifest<C>) -> Self {
         Self {
-            spec_version: manifest.spec_version.clone(),
+            spec_version: manifest.spec_version.to_string(),
             description: manifest.description.clone(),
             repository: manifest.repository.clone(),
             features: manifest.features.iter().map(|f| f.to_string()).collect(),
@@ -167,7 +179,7 @@ impl<'a, C: Blockchain> From<&'a super::SubgraphManifest<C>> for SubgraphManifes
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SubgraphError {
     pub subgraph_id: DeploymentHash,
     pub message: String,

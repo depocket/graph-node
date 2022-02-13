@@ -41,10 +41,6 @@ pub mod subgraph;
 /// Components dealing with Ethereum.
 pub mod ethereum;
 
-pub mod arweave;
-
-pub mod three_box;
-
 /// Components dealing with processing GraphQL.
 pub mod graphql;
 
@@ -76,3 +72,5 @@ pub trait EventProducer<E> {
     /// Avoid calling directly, prefer helpers such as `forward`.
     fn take_event_stream(&mut self) -> Option<Box<dyn Stream<Item = E, Error = ()> + Send>>;
 }
+
+pub mod transaction_receipt;

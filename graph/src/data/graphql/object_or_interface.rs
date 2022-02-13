@@ -1,6 +1,9 @@
 use crate::prelude::Schema;
 use crate::{components::store::EntityType, prelude::s};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
+use std::mem;
 
 use super::ObjectTypeExt;
 
@@ -8,6 +11,44 @@ use super::ObjectTypeExt;
 pub enum ObjectOrInterface<'a> {
     Object(&'a s::ObjectType),
     Interface(&'a s::InterfaceType),
+}
+
+impl<'a> PartialEq for ObjectOrInterface<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        use ObjectOrInterface::*;
+        match (self, other) {
+            (Object(a), Object(b)) => a.name == b.name,
+            (Interface(a), Interface(b)) => a.name == b.name,
+            (Interface(_), Object(_)) | (Object(_), Interface(_)) => false,
+        }
+    }
+}
+
+impl<'a> Eq for ObjectOrInterface<'a> {}
+
+impl<'a> Hash for ObjectOrInterface<'a> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        mem::discriminant(self).hash(state);
+        self.name().hash(state)
+    }
+}
+
+impl<'a> PartialOrd for ObjectOrInterface<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<'a> Ord for ObjectOrInterface<'a> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use ObjectOrInterface::*;
+        match (self, other) {
+            (Object(a), Object(b)) => a.name.cmp(&b.name),
+            (Interface(a), Interface(b)) => a.name.cmp(&b.name),
+            (Interface(_), Object(_)) => Ordering::Less,
+            (Object(_), Interface(_)) => Ordering::Greater,
+        }
+    }
 }
 
 impl<'a> From<&'a s::ObjectType> for ObjectOrInterface<'a> {

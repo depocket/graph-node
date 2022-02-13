@@ -25,6 +25,7 @@ type UtcDateTime = DateTime<Utc>;
 struct CopyState {
     src: i32,
     dst: i32,
+    #[allow(dead_code)]
     target_block_hash: Vec<u8>,
     target_block_number: i32,
     started_at: UtcDateTime,
@@ -35,12 +36,15 @@ struct CopyState {
 #[derive(Queryable, QueryableByName, Debug)]
 #[table_name = "copy_table_state"]
 struct CopyTableState {
+    #[allow(dead_code)]
     id: i32,
     entity_type: String,
+    #[allow(dead_code)]
     dst: i32,
     next_vid: i64,
     target_vid: i64,
     batch_size: i64,
+    #[allow(dead_code)]
     started_at: UtcDateTime,
     finished_at: Option<UtcDateTime>,
     duration_ms: i64,
@@ -207,8 +211,8 @@ pub fn status(pools: HashMap<Shard, ConnectionPool>, dst: i32) -> Result<(), Err
     }
 
     fn duration(start: &UtcDateTime, end: &Option<UtcDateTime>) -> String {
-        let start = start.clone();
-        let end = end.clone();
+        let start = *start;
+        let end = *end;
 
         let end = end.unwrap_or(UtcDateTime::from(SystemTime::now()));
         let duration = end - start;
@@ -256,6 +260,16 @@ pub fn status(pools: HashMap<Shard, ConnectionPool>, dst: i32) -> Result<(), Err
         }
     };
 
+    let progress = match &state.finished_at {
+        Some(_) => done(&state.finished_at),
+        None => {
+            let target: i64 = tables.iter().map(|table| table.target_vid).sum();
+            let next: i64 = tables.iter().map(|table| table.next_vid).sum();
+            let pct = next as f64 / target as f64 * 100.0;
+            format!("{:.2}% done, {}/{}", pct, next, target)
+        }
+    };
+
     let mut lst = vec![
         "deployment",
         "src",
@@ -270,7 +284,7 @@ pub fn status(pools: HashMap<Shard, ConnectionPool>, dst: i32) -> Result<(), Err
         state.dst.to_string(),
         state.target_block_number.to_string(),
         duration(&state.started_at, &state.finished_at),
-        done(&state.finished_at),
+        progress,
     ];
     match (cancelled_at, state.cancelled_at) {
         (Some(c), None) => {

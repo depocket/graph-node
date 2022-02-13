@@ -179,7 +179,7 @@ impl CopyState {
             ))
             .execute(conn)?;
 
-        let tables: Vec<_> = dst
+        let mut tables: Vec<_> = dst
             .tables
             .values()
             .filter_map(|dst_table| {
@@ -196,6 +196,7 @@ impl CopyState {
                     })
             })
             .collect::<Result<_, _>>()?;
+        tables.sort_by_key(|table| table.dst.object.to_string());
 
         let values = tables
             .iter()
@@ -350,6 +351,7 @@ impl TableState {
                 cts::batch_size,
                 cts::duration_ms,
             ))
+            .order_by(cts::entity_type)
             .load::<(i32, String, i64, i64, i64, i64)>(conn)?
             .into_iter()
             .map(
@@ -433,29 +435,26 @@ impl TableState {
         Ok(())
     }
 
+    fn is_cancelled(&self, conn: &PgConnection) -> Result<bool, StoreError> {
+        use active_copies as ac;
+
+        let dst = self.dst_site.as_ref();
+        let canceled = ac::table
+            .filter(ac::dst.eq(dst.id))
+            .select(ac::cancelled_at.is_not_null())
+            .get_result::<bool>(conn)?;
+        if canceled {
+            use copy_state as cs;
+
+            update(cs::table.filter(cs::dst.eq(dst.id)))
+                .set(cs::cancelled_at.eq(sql("now()")))
+                .execute(conn)?;
+        }
+        Ok(canceled)
+    }
+
     fn copy_batch(&mut self, conn: &PgConnection) -> Result<Status, StoreError> {
-        fn is_cancelled(dst: &Site, conn: &PgConnection) -> Result<bool, StoreError> {
-            use active_copies as ac;
-
-            let canceled = ac::table
-                .filter(ac::dst.eq(dst.id))
-                .select(ac::cancelled_at.is_not_null())
-                .get_result::<bool>(conn)?;
-            if canceled {
-                use copy_state as cs;
-
-                update(cs::table.filter(cs::dst.eq(dst.id)))
-                    .set(cs::cancelled_at.eq(sql("now()")))
-                    .execute(conn)?;
-            }
-            Ok(canceled)
-        }
-
         let start = Instant::now();
-
-        if is_cancelled(self.dst_site.as_ref(), conn)? {
-            return Ok(Status::Cancelled);
-        }
 
         // Copy all versions with next_vid <= vid <= next_vid + batch_size - 1,
         // but do not go over target_vid
@@ -480,10 +479,6 @@ impl TableState {
 
         if self.finished() {
             self.record_finished(conn)?;
-        }
-
-        if is_cancelled(self.dst_site.as_ref(), conn)? {
-            return Ok(Status::Cancelled);
         }
 
         Ok(Status::Finished)
@@ -626,6 +621,12 @@ impl Connection {
 
         for table in state.tables.iter_mut().filter(|table| !table.finished()) {
             while !table.finished() {
+                // It is important that this check happens outside the write
+                // transaction so that we do not hold on to locks acquired
+                // by the check
+                if table.is_cancelled(&self.conn)? {
+                    return Ok(Status::Cancelled);
+                }
                 let status = self.transaction(|conn| table.copy_batch(conn))?;
                 if status == Status::Cancelled {
                     return Ok(status);

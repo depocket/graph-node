@@ -12,22 +12,24 @@ use diesel::result::{Error as DieselError, QueryResult};
 use diesel::sql_types::{Array, BigInt, Binary, Bool, Integer, Jsonb, Range, Text};
 use diesel::Connection;
 use lazy_static::lazy_static;
-use std::collections::{BTreeMap, HashMap, HashSet};
+
+use graph::prelude::{
+    anyhow, r, serde_json, Attribute, BlockNumber, ChildMultiplicity, Entity, EntityCollection,
+    EntityFilter, EntityKey, EntityLink, EntityOrder, EntityRange, EntityWindow, ParentLink,
+    QueryExecutionError, StoreError, Value,
+};
+use graph::{
+    components::store::{AttributeNames, EntityType},
+    data::{schema::FulltextAlgorithm, store::scalar},
+};
+use itertools::Itertools;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::TryFrom;
 use std::env;
 use std::fmt::{self, Display};
 use std::iter::FromIterator;
 use std::str::FromStr;
-
-use graph::prelude::{
-    anyhow, q, serde_json, Attribute, BlockNumber, ChildMultiplicity, Entity, EntityCollection,
-    EntityFilter, EntityKey, EntityLink, EntityOrder, EntityRange, EntityWindow, ParentLink,
-    QueryExecutionError, StoreError, Value,
-};
-use graph::{
-    components::store::EntityType,
-    data::{schema::FulltextAlgorithm, store::scalar},
-};
 
 use crate::relational::{
     Column, ColumnType, IdType, Layout, SqlName, Table, PRIMARY_KEY_COLUMN, STRING_PREFIX_SIZE,
@@ -49,6 +51,18 @@ lazy_static! {
             .map(|s| {
                 usize::from_str(&s)
                     .unwrap_or_else(|_| panic!("TYPE_BATCH_SIZE must be a number, but is `{}`", s))
+            })
+            .unwrap_or(150)
+    };
+    /// Include a constraint on the child ids as a set in child_type_d
+    /// queries if the size of the set is below this threshold. Set this to
+    /// 0 to turn off this optimization
+    static ref TYPED_CHILDREN_SET_SIZE: usize = {
+        env::var("TYPED_CHILDREN_SET_SIZE")
+            .ok()
+            .map(|s| {
+                usize::from_str(&s)
+                    .unwrap_or_else(|_| panic!("TYPED_CHILDREN_SET_SIZE must be a number, but is `{}`", s))
             })
             .unwrap_or(150)
     };
@@ -74,6 +88,9 @@ lazy_static! {
             .unwrap_or(false)
     };
 }
+
+/// Those are columns that we always want to fetch from the database.
+const BASE_SQL_COLUMNS: [&'static str; 2] = ["id", "vid"];
 
 #[derive(Debug)]
 pub(crate) struct UnsupportedFilter {
@@ -252,8 +269,10 @@ impl ForeignKeyClauses for Column {
     }
 }
 
-pub trait FromEntityData: Default + From<Entity> {
+pub trait FromEntityData {
     type Value: FromColumnValue;
+
+    fn new_entity(typename: String) -> Self;
 
     fn insert_entity_data(&mut self, key: String, v: Self::Value);
 }
@@ -261,13 +280,25 @@ pub trait FromEntityData: Default + From<Entity> {
 impl FromEntityData for Entity {
     type Value = graph::prelude::Value;
 
+    fn new_entity(typename: String) -> Self {
+        let mut entity = Entity::new();
+        entity.insert("__typename".to_string(), Self::Value::String(typename));
+        entity
+    }
+
     fn insert_entity_data(&mut self, key: String, v: Self::Value) {
         self.insert(key, v);
     }
 }
 
-impl FromEntityData for BTreeMap<String, q::Value> {
-    type Value = q::Value;
+impl FromEntityData for BTreeMap<String, r::Value> {
+    type Value = r::Value;
+
+    fn new_entity(typename: String) -> Self {
+        let mut map = BTreeMap::new();
+        map.insert("__typename".to_string(), Self::Value::from_string(typename));
+        map
+    }
 
     fn insert_entity_data(&mut self, key: String, v: Self::Value) {
         self.insert(key, v);
@@ -355,9 +386,9 @@ pub trait FromColumnValue: Sized {
     }
 }
 
-impl FromColumnValue for q::Value {
+impl FromColumnValue for r::Value {
     fn is_null(&self) -> bool {
-        self == &q::Value::Null
+        matches!(self, r::Value::Null)
     }
 
     fn null() -> Self {
@@ -365,31 +396,31 @@ impl FromColumnValue for q::Value {
     }
 
     fn from_string(s: String) -> Self {
-        q::Value::String(s)
+        r::Value::String(s)
     }
 
     fn from_bool(b: bool) -> Self {
-        q::Value::Boolean(b)
+        r::Value::Boolean(b)
     }
 
     fn from_i32(i: i32) -> Self {
-        q::Value::Int(i.into())
+        r::Value::Int(i.into())
     }
 
     fn from_big_decimal(d: scalar::BigDecimal) -> Self {
-        q::Value::String(d.to_string())
+        r::Value::String(d.to_string())
     }
 
     fn from_big_int(i: serde_json::Number) -> Result<Self, StoreError> {
-        Ok(q::Value::String(i.to_string()))
+        Ok(r::Value::String(i.to_string()))
     }
 
     fn from_bytes(b: &str) -> Result<Self, StoreError> {
-        Ok(q::Value::String(format!("0x{}", b)))
+        Ok(r::Value::String(format!("0x{}", b)))
     }
 
     fn from_vec(v: Vec<Self>) -> Self {
-        q::Value::List(v)
+        r::Value::List(v)
     }
 }
 
@@ -464,11 +495,7 @@ impl EntityData {
         use serde_json::Value as j;
         match self.data {
             j::Object(map) => {
-                let mut out = T::default();
-                out.insert_entity_data(
-                    "__typename".to_owned(),
-                    T::Value::from_string(entity_type.into_string()),
-                );
+                let mut out = T::new_entity(entity_type.into_string());
                 for (key, json) in map {
                     // Simply ignore keys that do not have an underlying table
                     // column; those will be things like the block_range that
@@ -1178,11 +1205,11 @@ impl<'a, Conn> RunQueryDsl<Conn> for FindQuery<'a> {}
 
 #[derive(Debug, Clone, Constructor)]
 pub struct FindManyQuery<'a> {
-    pub(crate) namespace: &'a Namespace,
+    pub(crate) _namespace: &'a Namespace,
     pub(crate) tables: Vec<&'a Table>,
 
     // Maps object name to ids.
-    pub(crate) ids_for_type: BTreeMap<&'a EntityType, Vec<&'a str>>,
+    pub(crate) ids_for_type: &'a BTreeMap<&'a EntityType, Vec<&'a str>>,
     pub(crate) block: BlockNumber,
 }
 
@@ -1235,7 +1262,7 @@ impl<'a, Conn> RunQueryDsl<Conn> for FindManyQuery<'a> {}
 #[derive(Debug)]
 pub struct InsertQuery<'a> {
     table: &'a Table,
-    entities: &'a [(EntityKey, Entity)],
+    entities: &'a [(&'a EntityKey, Cow<'a, Entity>)],
     unique_columns: Vec<&'a Column>,
     block: BlockNumber,
 }
@@ -1243,7 +1270,7 @@ pub struct InsertQuery<'a> {
 impl<'a> InsertQuery<'a> {
     pub fn new(
         table: &'a Table,
-        entities: &'a mut [(EntityKey, Entity)],
+        entities: &'a mut [(&'a EntityKey, Cow<Entity>)],
         block: BlockNumber,
     ) -> Result<InsertQuery<'a>, StoreError> {
         for (entity_key, entity) in entities.iter_mut() {
@@ -1256,7 +1283,7 @@ impl<'a> InsertQuery<'a> {
                             .cloned()
                             .collect::<Vec<Value>>();
                         if !fulltext_field_values.is_empty() {
-                            entity.insert(
+                            entity.to_mut().insert(
                                 column.field.to_string(),
                                 Value::List(fulltext_field_values),
                             );
@@ -1285,7 +1312,10 @@ impl<'a> InsertQuery<'a> {
     }
 
     /// Build the column name list using the subset of all keys among present entities.
-    fn unique_columns(table: &'a Table, entities: &'a [(EntityKey, Entity)]) -> Vec<&'a Column> {
+    fn unique_columns(
+        table: &'a Table,
+        entities: &'a [(&'a EntityKey, Cow<'a, Entity>)],
+    ) -> Vec<&'a Column> {
         let mut hashmap = HashMap::new();
         for (_key, entity) in entities.iter() {
             for column in &table.columns {
@@ -1372,7 +1402,7 @@ impl<'a, Conn> RunQueryDsl<Conn> for InsertQuery<'a> {}
 
 #[derive(Debug, Clone)]
 pub struct ConflictingEntityQuery<'a> {
-    layout: &'a Layout,
+    _layout: &'a Layout,
     tables: Vec<&'a Table>,
     entity_id: &'a str,
 }
@@ -1387,7 +1417,7 @@ impl<'a> ConflictingEntityQuery<'a> {
             .map(|entity| layout.table_for_entity(entity).map(|table| table.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(ConflictingEntityQuery {
-            layout,
+            _layout: layout,
             tables,
             entity_id,
         })
@@ -1573,6 +1603,7 @@ pub struct FilterWindow<'a> {
     ids: Vec<String>,
     /// How to filter by a set of parents
     link: TableLink<'a>,
+    column_names: AttributeNames,
 }
 
 impl<'a> FilterWindow<'a> {
@@ -1585,8 +1616,17 @@ impl<'a> FilterWindow<'a> {
             child_type,
             ids,
             link,
+            column_names,
         } = window;
         let table = layout.table_for_entity(&child_type).map(|rc| rc.as_ref())?;
+
+        // Confidence check: ensure that all selected column names exist in the table
+        if let AttributeNames::Select(ref selected_field_names) = column_names {
+            for field in selected_field_names {
+                let _ = table.column_for_field(&field)?;
+            }
+        }
+
         let query_filter = query_filter
             .map(|filter| QueryFilter::new(filter, table))
             .transpose()?;
@@ -1596,6 +1636,7 @@ impl<'a> FilterWindow<'a> {
             query_filter,
             ids,
             link,
+            column_names,
         })
     }
 
@@ -1619,7 +1660,7 @@ impl<'a> FilterWindow<'a> {
         // Generate
         //      from unnest({parent_ids}) as p(id)
         //           cross join lateral
-        //           (select *
+        //           (select {column names}
         //              from children c
         //             where p.id = any(c.{parent_field})
         //               and .. other conditions on c ..
@@ -1629,7 +1670,9 @@ impl<'a> FilterWindow<'a> {
 
         out.push_sql("\n/* children_type_a */  from unnest(");
         column.bind_ids(&self.ids, out)?;
-        out.push_sql(") as p(id) cross join lateral (select * from ");
+        out.push_sql(") as p(id) cross join lateral (select ");
+        write_column_names(&self.column_names, &self.table, out)?;
+        out.push_sql(" from ");
         out.push_sql(self.table.qualified_name.as_str());
         out.push_sql(" c where ");
         BlockRangeContainsClause::new(&self.table, "c.", block).walk_ast(out.reborrow())?;
@@ -1696,7 +1739,7 @@ impl<'a> FilterWindow<'a> {
         // Generate
         //      from unnest({parent_ids}) as p(id)
         //           cross join lateral
-        //           (select *
+        //           (select {column names}
         //              from children c
         //             where p.id = c.{parent_field}
         //               and .. other conditions on c ..
@@ -1706,7 +1749,9 @@ impl<'a> FilterWindow<'a> {
 
         out.push_sql("\n/* children_type_b */  from unnest(");
         column.bind_ids(&self.ids, out)?;
-        out.push_sql(") as p(id) cross join lateral (select * from ");
+        out.push_sql(") as p(id) cross join lateral (select ");
+        write_column_names(&self.column_names, &self.table, out)?;
+        out.push_sql(" from ");
         out.push_sql(self.table.qualified_name.as_str());
         out.push_sql(" c where ");
         BlockRangeContainsClause::new(&self.table, "c.", block).walk_ast(out.reborrow())?;
@@ -1759,7 +1804,7 @@ impl<'a> FilterWindow<'a> {
         //      from rows from (unnest({parent_ids}), reduce_dim({child_id_matrix}))
         //                  as p(id, child_ids)
         //           cross join lateral
-        //           (select *
+        //           (select {column names}
         //              from children c
         //             where c.id = any(p.child_ids)
         //               and .. other conditions on c ..
@@ -1773,7 +1818,9 @@ impl<'a> FilterWindow<'a> {
         out.push_sql("), reduce_dim(");
         self.table.primary_key().push_matrix(&child_ids, out)?;
         out.push_sql(")) as p(id, child_ids)");
-        out.push_sql(" cross join lateral (select * from ");
+        out.push_sql(" cross join lateral (select ");
+        write_column_names(&self.column_names, &self.table, out)?;
+        out.push_sql(" from ");
         out.push_sql(self.table.qualified_name.as_str());
         out.push_sql(" c where ");
         BlockRangeContainsClause::new(&self.table, "c.", block).walk_ast(out.reborrow())?;
@@ -1807,6 +1854,17 @@ impl<'a> FilterWindow<'a> {
         out.push_sql(" c where ");
         BlockRangeContainsClause::new(&self.table, "c.", block).walk_ast(out.reborrow())?;
         limit.filter(out);
+        if *TYPED_CHILDREN_SET_SIZE > 0 {
+            let mut child_set: Vec<&str> = child_ids.iter().map(|id| id.as_str()).collect();
+            child_set.sort();
+            child_set.dedup();
+
+            if child_set.len() <= *TYPED_CHILDREN_SET_SIZE {
+                out.push_sql(" and c.id = any(");
+                self.table.primary_key().bind_ids(&child_set, out)?;
+                out.push_sql(")");
+            }
+        }
         out.push_sql(" and ");
         out.push_sql("c.id = p.child_id");
         self.and_filter(out.reborrow())?;
@@ -1878,7 +1936,7 @@ impl<'a> FilterWindow<'a> {
 pub enum FilterCollection<'a> {
     /// Collection made from all entities in a table; each entry is the table
     /// and the filter to apply to it, checked and bound to that table
-    All(Vec<(&'a Table, Option<QueryFilter<'a>>)>),
+    All(Vec<(&'a Table, Option<QueryFilter<'a>>, AttributeNames)>),
     /// Collection made from windows of the same or different entity types
     SingleWindow(FilterWindow<'a>),
     MultiWindow(Vec<FilterWindow<'a>>, Vec<String>),
@@ -1898,7 +1956,7 @@ impl<'a> FilterCollection<'a> {
                 // to it
                 let entities = entities
                     .iter()
-                    .map(|entity| {
+                    .map(|(entity, column_names)| {
                         layout
                             .table_for_entity(&entity)
                             .map(|rc| rc.as_ref())
@@ -1906,7 +1964,7 @@ impl<'a> FilterCollection<'a> {
                                 filter
                                     .map(|filter| QueryFilter::new(filter, table))
                                     .transpose()
-                                    .map(|filter| (table, filter))
+                                    .map(|filter| (table, filter, column_names.clone()))
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -2258,7 +2316,7 @@ impl<'a> FilterQuery<'a> {
     ///
     ///   select '..' as entity, to_jsonb(e.*) as data
     ///     from
-    ///       (select *
+    ///       (select {column names}
     ///          from table c
     ///         where block_range @> $block
     ///           and filter
@@ -2268,9 +2326,11 @@ impl<'a> FilterQuery<'a> {
         table: &Table,
         filter: &Option<QueryFilter>,
         mut out: AstPass<Pg>,
+        column_names: &AttributeNames,
     ) -> QueryResult<()> {
         Self::select_entity_and_data(table, &mut out);
-        out.push_sql(" from (select * ");
+        out.push_sql(" from (select ");
+        write_column_names(&column_names, &table, &mut out)?;
         self.filtered_rows(table, filter, out.reborrow())?;
         out.push_sql("\n ");
         self.sort_key.order_by(&mut out)?;
@@ -2307,7 +2367,7 @@ impl<'a> FilterQuery<'a> {
     /// No windowing, but multiple entity types
     fn query_no_window(
         &self,
-        entities: &Vec<(&Table, Option<QueryFilter>)>,
+        entities: &Vec<(&Table, Option<QueryFilter>, AttributeNames)>,
         mut out: AstPass<Pg>,
     ) -> QueryResult<()> {
         // We have multiple tables which might have different schemas since
@@ -2327,7 +2387,8 @@ impl<'a> FilterQuery<'a> {
         //    ...
         //    order by {sort_key}
         //    limit n offset m)
-        // select m.entity, to_jsonb(c.*) as data, c.id, c.{sort_key}
+        //
+        // select m.entity, to_jsonb({column names}) as data, c.id, c.{sort_key}
         //   from {table} c, matches m
         //  where c.vid = m.vid and m.entity = '...'
         //  union all
@@ -2336,7 +2397,7 @@ impl<'a> FilterQuery<'a> {
 
         // Step 1: build matches CTE
         out.push_sql("with matches as (");
-        for (i, (table, filter)) in entities.iter().enumerate() {
+        for (i, (table, filter, _column_names)) in entities.iter().enumerate() {
             if i > 0 {
                 out.push_sql("\nunion all\n");
             }
@@ -2357,11 +2418,13 @@ impl<'a> FilterQuery<'a> {
         out.push_sql(")\n");
 
         // Step 2: convert to JSONB
-        for (i, (table, _)) in entities.iter().enumerate() {
+        for (i, (table, _, column_names)) in entities.iter().enumerate() {
             if i > 0 {
                 out.push_sql("\nunion all\n");
             }
-            out.push_sql("select m.entity, to_jsonb(c.*) as data, c.id");
+            out.push_sql("select m.entity, ");
+            jsonb_build_object(column_names, "c", &table, &mut out)?;
+            out.push_sql(" as data, c.id");
             self.sort_key.select(&mut out)?;
             out.push_sql("\n  from ");
             out.push_sql(table.qualified_name.as_str());
@@ -2435,20 +2498,27 @@ impl<'a> FilterQuery<'a> {
         // the hassle of making `Table` hashable
         let unique_child_tables = windows
             .iter()
-            .map(|window| (&window.table.qualified_name, &window.table.object))
-            .collect::<HashSet<_>>();
-        for (i, (table_name, object)) in unique_child_tables.into_iter().enumerate() {
+            .unique_by(|window| {
+                (
+                    &window.table.qualified_name,
+                    &window.table.object,
+                    &window.column_names,
+                )
+            })
+            .enumerate()
+            .into_iter();
+
+        for (i, window) in unique_child_tables {
             if i > 0 {
                 out.push_sql("\nunion all\n");
             }
-            out.push_sql(
-                "select m.*, \
-                 to_jsonb(c.*) || jsonb_build_object('g$parent_id', m.g$parent_id) as data",
-            );
+            out.push_sql("select m.*, ");
+            jsonb_build_object(&window.column_names, "c", &window.table, &mut out)?;
+            out.push_sql("|| jsonb_build_object('g$parent_id', m.g$parent_id) as data");
             out.push_sql("\n  from ");
-            out.push_sql(table_name.as_str());
+            out.push_sql(&window.table.qualified_name.as_str());
             out.push_sql(" c, matches m\n where c.vid = m.vid and m.entity = '");
-            out.push_sql(object.as_str());
+            out.push_sql(&window.table.object.as_str());
             out.push_sql("'");
         }
         out.push_sql("\n ");
@@ -2479,10 +2549,10 @@ impl<'a> QueryFragment<Pg> for FilterQuery<'a> {
         match &self.collection {
             FilterCollection::All(entities) => {
                 if entities.len() == 1 {
-                    let (table, filter) = entities
+                    let (table, filter, column_names) = entities
                         .first()
                         .expect("a query always uses at least one table");
-                    self.query_no_window_one_entity(table, filter, out)
+                    self.query_no_window_one_entity(table, filter, out, column_names)
                 } else {
                     self.query_no_window(entities, out)
                 }
@@ -2514,6 +2584,7 @@ impl<'a, Conn> RunQueryDsl<Conn> for FilterQuery<'a> {}
 #[derive(Debug, Clone, Constructor)]
 pub struct ClampRangeQuery<'a, S> {
     table: &'a Table,
+    #[allow(dead_code)]
     entity_type: &'a EntityType,
     entity_ids: &'a [S],
     block: BlockNumber,
@@ -2706,54 +2777,6 @@ fn block_number_max_is_i32_max() {
     assert_eq!(2147483647, graph::prelude::BLOCK_NUMBER_MAX);
 }
 
-/// Remove all entities from the given table whose id has a prefix that
-/// matches one of the given prefixes. This query is mostly useful to
-/// delete subgraph metadata that belongs to a certain dynamic data source
-#[derive(Debug, Clone, Constructor)]
-pub struct DeleteByPrefixQuery<'a> {
-    table: &'a Table,
-    prefixes: &'a Vec<String>,
-    prefix_len: i32,
-}
-
-impl<'a> QueryFragment<Pg> for DeleteByPrefixQuery<'a> {
-    fn walk_ast(&self, mut out: AstPass<Pg>) -> QueryResult<()> {
-        out.unsafe_to_cache_prepared();
-
-        // Construct a query
-        //   delete from {table}
-        //    where left(id, {prefix_len}) = any({prefixes})
-        //   returning id
-        out.push_sql("delete from ");
-        out.push_sql(self.table.qualified_name.as_str());
-        out.push_sql("\n where left(");
-        out.push_sql(PRIMARY_KEY_COLUMN);
-        out.push_sql(",");
-        out.push_bind_param::<Integer, _>(&self.prefix_len)?;
-        out.push_sql(") = any(");
-        out.push_bind_param::<Array<Text>, _>(&self.prefixes)?;
-        out.push_sql(")\nreturning ");
-        out.push_sql(PRIMARY_KEY_COLUMN);
-        out.push_sql("::text");
-        Ok(())
-    }
-}
-
-impl<'a> QueryId for DeleteByPrefixQuery<'a> {
-    type QueryId = ();
-
-    const HAS_STATIC_QUERY_ID: bool = false;
-}
-
-impl<'a> LoadQuery<PgConnection, ReturnedEntityData> for DeleteByPrefixQuery<'a> {
-    fn internal_load(self, conn: &PgConnection) -> QueryResult<Vec<ReturnedEntityData>> {
-        conn.query_by_name(&self)
-            .map(|data| ReturnedEntityData::bytes_as_str(&self.table, data))
-    }
-}
-
-impl<'a, Conn> RunQueryDsl<Conn> for DeleteByPrefixQuery<'a> {}
-
 /// Copy the data of one table to another table. All rows whose `vid` is in
 /// the range `[first_vid, last_vid]` will be copied
 #[derive(Debug, Clone)]
@@ -2790,8 +2813,6 @@ impl<'a> CopyEntityBatchQuery<'a> {
                     dcol.field
                 )
                 .into());
-            } else {
-                columns.push(dcol);
             }
         }
 
@@ -2860,4 +2881,76 @@ impl<'a, Conn> RunQueryDsl<Conn> for CopyEntityBatchQuery<'a> {}
 pub struct CopyVid {
     #[sql_type = "BigInt"]
     pub vid: i64,
+}
+
+fn write_column_names(
+    column_names: &AttributeNames,
+    table: &Table,
+    out: &mut AstPass<Pg>,
+) -> QueryResult<()> {
+    match column_names {
+        AttributeNames::All => out.push_sql(" * "),
+        AttributeNames::Select(column_names) => {
+            let mut iterator = iter_column_names(column_names, table).peekable();
+            while let Some(column_name) = iterator.next() {
+                out.push_identifier(&column_name)?;
+                if iterator.peek().is_some() {
+                    out.push_sql(", ");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn jsonb_build_object(
+    column_names: &AttributeNames,
+    table_identifier: &str,
+    table: &Table,
+    out: &mut AstPass<Pg>,
+) -> QueryResult<()> {
+    match column_names {
+        AttributeNames::All => {
+            out.push_sql("to_jsonb(\"");
+            out.push_sql(table_identifier);
+            out.push_sql("\".*)");
+        }
+        AttributeNames::Select(column_names) => {
+            out.push_sql("jsonb_build_object(");
+            let mut iterator = iter_column_names(column_names, table).peekable();
+            while let Some(column_name) = iterator.next() {
+                // field name as json key
+                out.push_sql("'");
+                out.push_sql(column_name);
+                out.push_sql("', ");
+                // column identifier
+                out.push_sql(table_identifier);
+                out.push_sql(".");
+                out.push_identifier(column_name)?;
+                if iterator.peek().is_some() {
+                    out.push_sql(", ");
+                }
+            }
+            out.push_sql(")");
+        }
+    }
+    Ok(())
+}
+
+/// Helper function to iterate over the merged fields of BASE_SQL_COLUMNS and the provided attribute
+/// names, yielding valid SQL names for the given table.
+fn iter_column_names<'a, 'b>(
+    attribute_names: &'a BTreeSet<String>,
+    table: &'b Table,
+) -> impl Iterator<Item = &'b str> {
+    attribute_names
+        .iter()
+        .map(|attribute_name| {
+            // Unwrapping: We have already checked that all attribute names exist in table
+            table.column_for_field(attribute_name).unwrap()
+        })
+        .map(|column| column.name.as_str())
+        .chain(BASE_SQL_COLUMNS.iter().copied())
+        .sorted()
+        .dedup()
 }

@@ -37,15 +37,11 @@ where
         path: &str,
     ) -> Result<Option<DeploymentState>, Error> {
         fn target_from_name(name: String) -> Option<QueryTarget> {
-            SubgraphName::new(name)
-                .ok()
-                .map(|name| QueryTarget::Name(name))
+            SubgraphName::new(name).ok().map(QueryTarget::Name)
         }
 
         fn target_from_id(id: &str) -> Option<QueryTarget> {
-            DeploymentHash::new(id)
-                .ok()
-                .map(|id| QueryTarget::Deployment(id))
+            DeploymentHash::new(id).ok().map(QueryTarget::Deployment)
         }
 
         async fn state<S: QueryStoreManager>(
@@ -63,7 +59,7 @@ where
         }
 
         let path_segments = {
-            let mut segments = path.split("/");
+            let mut segments = path.split('/');
 
             // Remove leading '/'
             let first_segment = segments.next();
@@ -102,7 +98,7 @@ where
         );
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
-        let mut socket = TcpListener::bind(&addr)
+        let socket = TcpListener::bind(&addr)
             .await
             .expect("Failed to bind WebSocket port");
 

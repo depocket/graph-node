@@ -1,27 +1,37 @@
 use anyhow::{anyhow, Error};
 use anyhow::{ensure, Context};
-use ethabi::{Address, Event, Function, LogParam, ParamType, RawLog};
+use graph::blockchain::TriggerWithHandler;
 use graph::components::store::StoredDynamicDataSource;
+use graph::prelude::ethabi::ethereum_types::H160;
+use graph::prelude::ethabi::StateMutability;
+use graph::prelude::futures03::future::try_join;
+use graph::prelude::futures03::stream::FuturesOrdered;
+use graph::prelude::{Entity, Link, SubgraphManifestValidationError};
+use graph::slog::{o, trace};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::{convert::TryFrom, sync::Arc};
-use tiny_keccak::keccak256;
-use web3::types::Log;
+use tiny_keccak::{keccak256, Keccak};
 
 use graph::{
-    blockchain::{self, Blockchain, DataSource as _},
+    blockchain::{self, Blockchain},
     prelude::{
-        async_trait, info, serde_json, BlockNumber, CheapClone, DataSourceTemplateInfo,
-        Deserialize, EthereumCall, LightEthereumBlock, LightEthereumBlockExt, LinkResolver, Logger,
+        async_trait,
+        ethabi::{Address, Contract, Event, Function, LogParam, ParamType, RawLog},
+        info, serde_json,
+        web3::types::{Log, Transaction, H256},
+        BlockNumber, CheapClone, DataSourceTemplateInfo, Deserialize, EthereumCall,
+        LightEthereumBlock, LightEthereumBlockExt, LinkResolver, Logger, TryStreamExt,
     },
 };
 
-use graph::data::subgraph::{
-    BlockHandlerFilter, DataSourceContext, Mapping, MappingABI, MappingBlockHandler,
-    MappingCallHandler, MappingEventHandler, Source, TemplateSource, UnresolvedMapping,
-};
+use graph::data::subgraph::{calls_host_fn, DataSourceContext, Source};
 
 use crate::chain::Chain;
 use crate::trigger::{EthereumBlockTriggerType, EthereumTrigger, MappingTrigger};
+
+// The recommended kind is `ethereum`, `ethereum/contract` is accepted for backwards compatibility.
+const ETHEREUM_KINDS: &[&str] = &["ethereum/contract", "ethereum"];
 
 /// Runtime representation of a data source.
 // Note: Not great for memory usage that this needs to be `Clone`, considering how there may be tens
@@ -38,50 +48,23 @@ pub struct DataSource {
     pub contract_abi: Arc<MappingABI>,
 }
 
-// ETHDEP: The whole DataSource struct needs to move to chain::ethereum
 impl blockchain::DataSource<Chain> for DataSource {
+    fn address(&self) -> Option<&[u8]> {
+        self.source.address.as_ref().map(|x| x.as_bytes())
+    }
+
+    fn start_block(&self) -> BlockNumber {
+        self.source.start_block
+    }
+
     fn match_and_decode(
         &self,
         trigger: &<Chain as Blockchain>::TriggerData,
         block: Arc<<Chain as Blockchain>::Block>,
         logger: &Logger,
-    ) -> Result<Option<<Chain as Blockchain>::MappingTrigger>, Error> {
-        let block = Arc::new(block.0.light_block());
+    ) -> Result<Option<TriggerWithHandler<Chain>>, Error> {
+        let block = block.light_block();
         self.match_and_decode(trigger, block, logger)
-    }
-
-    fn mapping(&self) -> &Mapping {
-        &self.mapping
-    }
-
-    fn source(&self) -> &Source {
-        &self.source
-    }
-
-    fn from_manifest(
-        kind: String,
-        network: Option<String>,
-        name: String,
-        source: Source,
-        mapping: Mapping,
-        context: Option<DataSourceContext>,
-    ) -> Result<Self, Error> {
-        // Data sources in the manifest are created "before genesis" so they have no creation block.
-        let creation_block = None;
-        let contract_abi = mapping
-            .find_abi(&source.abi)
-            .with_context(|| format!("data source `{}`", name))?;
-
-        Ok(DataSource {
-            kind,
-            network,
-            name,
-            source,
-            mapping,
-            context: Arc::new(context),
-            creation_block,
-            contract_abi,
-        })
     }
 
     fn name(&self) -> &str {
@@ -145,9 +128,115 @@ impl blockchain::DataSource<Chain> for DataSource {
             creation_block: self.creation_block,
         }
     }
+
+    fn from_stored_dynamic_data_source(
+        templates: &BTreeMap<&str, &DataSourceTemplate>,
+        stored: StoredDynamicDataSource,
+    ) -> Result<Self, Error> {
+        let StoredDynamicDataSource {
+            name,
+            source,
+            context,
+            creation_block,
+        } = stored;
+        let template = templates
+            .get(name.as_str())
+            .ok_or_else(|| anyhow!("no template named `{}` was found", name))?;
+        let context = context
+            .map(|ctx| serde_json::from_str::<Entity>(&ctx))
+            .transpose()?;
+
+        let contract_abi = template.mapping.find_abi(&template.source.abi)?;
+
+        Ok(DataSource {
+            kind: template.kind.to_string(),
+            network: template.network.as_ref().map(|s| s.to_string()),
+            name,
+            source,
+            mapping: template.mapping.clone(),
+            context: Arc::new(context),
+            creation_block,
+            contract_abi,
+        })
+    }
+
+    fn validate(&self) -> Vec<Error> {
+        let mut errors = vec![];
+
+        if !ETHEREUM_KINDS.contains(&self.kind.as_str()) {
+            errors.push(anyhow!(
+                "data source has invalid `kind`, expected `ethereum` but found {}",
+                self.kind
+            ))
+        }
+
+        // Validate that there is a `source` address if there are call or block handlers
+        let no_source_address = self.address().is_none();
+        let has_call_handlers = !self.mapping.call_handlers.is_empty();
+        let has_block_handlers = !self.mapping.block_handlers.is_empty();
+        if no_source_address && (has_call_handlers || has_block_handlers) {
+            errors.push(SubgraphManifestValidationError::SourceAddressRequired.into());
+        };
+
+        // Validate that there are no more than one of each type of block_handler
+        let has_too_many_block_handlers = {
+            let mut non_filtered_block_handler_count = 0;
+            let mut call_filtered_block_handler_count = 0;
+            self.mapping
+                .block_handlers
+                .iter()
+                .for_each(|block_handler| {
+                    if block_handler.filter.is_none() {
+                        non_filtered_block_handler_count += 1
+                    } else {
+                        call_filtered_block_handler_count += 1
+                    }
+                });
+            non_filtered_block_handler_count > 1 || call_filtered_block_handler_count > 1
+        };
+        if has_too_many_block_handlers {
+            errors.push(anyhow!("data source has duplicated block handlers"));
+        }
+
+        errors
+    }
+
+    fn api_version(&self) -> semver::Version {
+        self.mapping.api_version.clone()
+    }
+
+    fn runtime(&self) -> &[u8] {
+        self.mapping.runtime.as_ref()
+    }
 }
 
 impl DataSource {
+    fn from_manifest(
+        kind: String,
+        network: Option<String>,
+        name: String,
+        source: Source,
+        mapping: Mapping,
+        context: Option<DataSourceContext>,
+    ) -> Result<Self, Error> {
+        // Data sources in the manifest are created "before genesis" so they have no creation block.
+        let creation_block = None;
+        let contract_abi = mapping
+            .find_abi(&source.abi)
+            .with_context(|| format!("data source `{}`", name))?;
+
+        Ok(DataSource {
+            kind,
+            network,
+            name,
+            source,
+            mapping,
+            context: Arc::new(context),
+            creation_block,
+            contract_abi,
+        })
+    }
+
     fn handlers_for_log(&self, log: &Log) -> Result<Vec<MappingEventHandler>, Error> {
         // Get signature from the log
         let topic0 = log.topics.get(0).context("Ethereum event has no topics")?;
@@ -284,7 +373,7 @@ impl DataSource {
 
                 // Extract the event name; if there is no '(' in the signature,
                 // `event_name` will be empty and not match any events, so that's ok
-                let parens = signature.find("(").unwrap_or(0);
+                let parens = signature.find('(').unwrap_or(0);
                 let event_name = &signature[0..parens];
 
                 let matching_events = self
@@ -313,8 +402,8 @@ impl DataSource {
             .contract
             .functions()
             .filter(|function| match function.state_mutability {
-                ethabi::StateMutability::Payable | ethabi::StateMutability::NonPayable => true,
-                ethabi::StateMutability::Pure | ethabi::StateMutability::View => false,
+                StateMutability::Payable | StateMutability::NonPayable => true,
+                StateMutability::Pure | StateMutability::View => false,
             })
             .find(|function| {
                 // Construct the argument function signature:
@@ -360,7 +449,7 @@ impl DataSource {
         trigger: &EthereumTrigger,
         block: Arc<LightEthereumBlock>,
         logger: &Logger,
-    ) -> Result<Option<MappingTrigger>, Error> {
+    ) -> Result<Option<TriggerWithHandler<Chain>>, Error> {
         if !self.matches_trigger_address(&trigger) {
             return Ok(None);
         }
@@ -375,7 +464,10 @@ impl DataSource {
                     Some(handler) => handler,
                     None => return Ok(None),
                 };
-                Ok(Some(MappingTrigger::Block { block, handler }))
+                Ok(Some(TriggerWithHandler::new(
+                    MappingTrigger::Block { block },
+                    handler.handler,
+                )))
             }
             EthereumTrigger::Log(log) => {
                 let potential_handlers = self.handlers_for_log(log)?;
@@ -416,7 +508,7 @@ impl DataSource {
                             })
                             .map(|log| log.params)
                             .map_err(|e| {
-                                info!(
+                                trace!(
                                     logger,
                                     "Skipping handler because the event parameters do not \
                                     match the event signature. This is typically the case \
@@ -447,19 +539,41 @@ impl DataSource {
                     )
                 );
 
-                let transaction = Arc::new(
+                // Special case: In Celo, there are Epoch Rewards events, which do not have an
+                // associated transaction and instead have `transaction_hash == block.hash`,
+                // in which case we pass a dummy transaction to the mappings.
+                // See also ca0edc58-0ec5-4c89-a7dd-2241797f5e50.
+                let transaction = if log.transaction_hash != block.hash {
                     block
                         .transaction_for_log(&log)
-                        .context("Found no transaction for event")?,
-                );
+                        .context("Found no transaction for event")?
+                } else {
+                    // Infer some fields from the log and fill the rest with zeros.
+                    Transaction {
+                        hash: log.transaction_hash.unwrap(),
+                        block_hash: block.hash,
+                        block_number: block.number,
+                        transaction_index: log.transaction_index,
+                        from: Some(H160::zero()),
+                        ..Transaction::default()
+                    }
+                };
 
-                Ok(Some(MappingTrigger::Log {
-                    block,
-                    transaction,
-                    log: log.cheap_clone(),
-                    params,
-                    handler: event_handler,
-                }))
+                let logging_extras = Arc::new(o! {
+                    "signature" => event_handler.event.to_string(),
+                    "address" => format!("{}", &log.address),
+                    "transaction" => format!("{}", &transaction.hash),
+                });
+                Ok(Some(TriggerWithHandler::new_with_logging_extras(
+                    MappingTrigger::Log {
+                        block,
+                        transaction: Arc::new(transaction),
+                        log: log.cheap_clone(),
+                        params,
+                    },
+                    event_handler.handler,
+                    logging_extras,
+                )))
             }
             EthereumTrigger::Call(call) => {
                 // Identify the call handler for this call
@@ -546,15 +660,22 @@ impl DataSource {
                         .transaction_for_call(&call)
                         .context("Found no transaction for call")?,
                 );
-
-                Ok(Some(MappingTrigger::Call {
-                    block,
-                    transaction,
-                    call: call.cheap_clone(),
-                    inputs,
-                    outputs,
-                    handler,
-                }))
+                let logging_extras = Arc::new(o! {
+                    "function" => handler.function.to_string(),
+                    "to" => format!("{}", &call.to),
+                    "transaction" => format!("{}", &transaction.hash),
+                });
+                Ok(Some(TriggerWithHandler::new_with_logging_extras(
+                    MappingTrigger::Call {
+                        block,
+                        transaction,
+                        call: call.cheap_clone(),
+                        inputs,
+                        outputs,
+                    },
+                    handler.handler,
+                    logging_extras,
+                )))
             }
         }
     }
@@ -586,7 +707,7 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
             context,
         } = self;
 
-        info!(logger, "Resolve data source"; "name" => &name, "source" => &source.start_block);
+        info!(logger, "Resolve data source"; "name" => &name, "source_address" => format_args!("{:?}", source.address), "source_start_block" => source.start_block);
 
         let mapping = mapping.resolve(&*resolver, logger).await?;
 
@@ -594,12 +715,10 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
     }
 }
 
-impl<C: Blockchain<DataSource = DataSource, DataSourceTemplate = DataSourceTemplate>>
-    TryFrom<DataSourceTemplateInfo<C>> for DataSource
-{
+impl TryFrom<DataSourceTemplateInfo<Chain>> for DataSource {
     type Error = anyhow::Error;
 
-    fn try_from(info: DataSourceTemplateInfo<C>) -> Result<Self, anyhow::Error> {
+    fn try_from(info: DataSourceTemplateInfo<Chain>) -> Result<Self, anyhow::Error> {
         let DataSourceTemplateInfo {
             template,
             params,
@@ -687,23 +806,212 @@ impl blockchain::UnresolvedDataSourceTemplate<Chain> for UnresolvedDataSourceTem
 }
 
 impl blockchain::DataSourceTemplate<Chain> for DataSourceTemplate {
-    fn mapping(&self) -> &Mapping {
-        &self.mapping
-    }
-
     fn name(&self) -> &str {
         &self.name
     }
 
-    fn source(&self) -> &TemplateSource {
-        &self.source
+    fn api_version(&self) -> semver::Version {
+        self.mapping.api_version.clone()
     }
 
-    fn kind(&self) -> &str {
-        &self.kind
+    fn runtime(&self) -> &[u8] {
+        self.mapping.runtime.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnresolvedMapping {
+    pub kind: String,
+    pub api_version: String,
+    pub language: String,
+    pub entities: Vec<String>,
+    pub abis: Vec<UnresolvedMappingABI>,
+    #[serde(default)]
+    pub block_handlers: Vec<MappingBlockHandler>,
+    #[serde(default)]
+    pub call_handlers: Vec<MappingCallHandler>,
+    #[serde(default)]
+    pub event_handlers: Vec<MappingEventHandler>,
+    pub file: Link,
+}
+
+#[derive(Clone, Debug)]
+pub struct Mapping {
+    pub kind: String,
+    pub api_version: semver::Version,
+    pub language: String,
+    pub entities: Vec<String>,
+    pub abis: Vec<Arc<MappingABI>>,
+    pub block_handlers: Vec<MappingBlockHandler>,
+    pub call_handlers: Vec<MappingCallHandler>,
+    pub event_handlers: Vec<MappingEventHandler>,
+    pub runtime: Arc<Vec<u8>>,
+    pub link: Link,
+}
+
+impl Mapping {
+    pub fn requires_archive(&self) -> anyhow::Result<bool> {
+        calls_host_fn(&self.runtime, "ethereum.call")
     }
 
-    fn network(&self) -> Option<&str> {
-        self.network.as_ref().map(|s| s.as_str())
+    pub fn has_call_handler(&self) -> bool {
+        !self.call_handlers.is_empty()
     }
+
+    pub fn has_block_handler_with_call_filter(&self) -> bool {
+        self.block_handlers
+            .iter()
+            .any(|handler| matches!(handler.filter, Some(BlockHandlerFilter::Call)))
+    }
+
+    pub fn find_abi(&self, abi_name: &str) -> Result<Arc<MappingABI>, Error> {
+        Ok(self
+            .abis
+            .iter()
+            .find(|abi| abi.name == abi_name)
+            .ok_or_else(|| anyhow!("No ABI entry with name `{}` found", abi_name))?
+            .cheap_clone())
+    }
+}
+
+impl UnresolvedMapping {
+    pub async fn resolve(
+        self,
+        resolver: &impl LinkResolver,
+        logger: &Logger,
+    ) -> Result<Mapping, anyhow::Error> {
+        let UnresolvedMapping {
+            kind,
+            api_version,
+            language,
+            entities,
+            abis,
+            block_handlers,
+            call_handlers,
+            event_handlers,
+            file: link,
+        } = self;
+
+        info!(logger, "Resolve mapping"; "link" => &link.link);
+
+        let api_version = semver::Version::parse(&api_version)?;
+
+        let (abis, runtime) = try_join(
+            // resolve each abi
+            abis.into_iter()
+                .map(|unresolved_abi| async {
+                    Result::<_, Error>::Ok(Arc::new(
+                        unresolved_abi.resolve(resolver, logger).await?,
+                    ))
+                })
+                .collect::<FuturesOrdered<_>>()
+                .try_collect::<Vec<_>>(),
+            async {
+                let module_bytes = resolver.cat(logger, &link).await?;
+                Ok(Arc::new(module_bytes))
+            },
+        )
+        .await?;
+
+        Ok(Mapping {
+            kind,
+            api_version,
+            language,
+            entities,
+            abis,
+            block_handlers: block_handlers.clone(),
+            call_handlers: call_handlers.clone(),
+            event_handlers: event_handlers.clone(),
+            runtime,
+            link,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
+pub struct UnresolvedMappingABI {
+    pub name: String,
+    pub file: Link,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MappingABI {
+    pub name: String,
+    pub contract: Contract,
+}
+
+impl UnresolvedMappingABI {
+    pub async fn resolve(
+        self,
+        resolver: &impl LinkResolver,
+        logger: &Logger,
+    ) -> Result<MappingABI, anyhow::Error> {
+        info!(
+            logger,
+            "Resolve ABI";
+            "name" => &self.name,
+            "link" => &self.file.link
+        );
+
+        let contract_bytes = resolver.cat(&logger, &self.file).await?;
+        let contract = Contract::load(&*contract_bytes)?;
+        Ok(MappingABI {
+            name: self.name,
+            contract,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
+pub struct MappingBlockHandler {
+    pub handler: String,
+    pub filter: Option<BlockHandlerFilter>,
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum BlockHandlerFilter {
+    // Call filter will trigger on all blocks where the data source contract
+    // address has been called
+    Call,
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
+pub struct MappingCallHandler {
+    pub function: String,
+    pub handler: String,
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
+pub struct MappingEventHandler {
+    pub event: String,
+    pub topic0: Option<H256>,
+    pub handler: String,
+}
+
+impl MappingEventHandler {
+    pub fn topic0(&self) -> H256 {
+        self.topic0
+            .unwrap_or_else(|| string_to_h256(&self.event.replace("indexed ", "")))
+    }
+}
+
+/// Hashes a string to a H256 hash.
+fn string_to_h256(s: &str) -> H256 {
+    let mut result = [0u8; 32];
+    let data = s.replace(" ", "").into_bytes();
+    let mut sponge = Keccak::new_keccak256();
+    sponge.update(&data);
+    sponge.finalize(&mut result);
+
+    // This was deprecated but the replacement seems to not be available in the
+    // version web3 uses.
+    #[allow(deprecated)]
+    H256::from_slice(&result)
+}
+
+#[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
+pub struct TemplateSource {
+    pub abi: String,
 }

@@ -21,33 +21,45 @@ pub type IndexNodeServiceResponse = DynTryFuture<'static, Response<Body>, GraphQ
 
 /// A Hyper Service that serves GraphQL over a POST / endpoint.
 #[derive(Debug)]
-pub struct IndexNodeService<Q, S> {
+pub struct IndexNodeService<Q, S, R, St> {
     logger: Logger,
     graphql_runner: Arc<Q>,
     store: Arc<S>,
     explorer: Arc<Explorer<S>>,
+    link_resolver: Arc<R>,
+    subgraph_store: Arc<St>,
 }
 
-impl<Q, S> Clone for IndexNodeService<Q, S> {
+impl<Q, S, R, St> Clone for IndexNodeService<Q, S, R, St> {
     fn clone(&self) -> Self {
         Self {
             logger: self.logger.clone(),
             graphql_runner: self.graphql_runner.clone(),
             store: self.store.clone(),
             explorer: self.explorer.clone(),
+            link_resolver: self.link_resolver.clone(),
+            subgraph_store: self.subgraph_store.clone(),
         }
     }
 }
 
-impl<Q, S> CheapClone for IndexNodeService<Q, S> {}
+impl<Q, S, R, St> CheapClone for IndexNodeService<Q, S, R, St> {}
 
-impl<Q, S> IndexNodeService<Q, S>
+impl<Q, S, R, St> IndexNodeService<Q, S, R, St>
 where
     Q: GraphQlRunner,
     S: StatusStore,
+    R: LinkResolver,
+    St: SubgraphStore,
 {
     /// Creates a new GraphQL service.
-    pub fn new(logger: Logger, graphql_runner: Arc<Q>, store: Arc<S>) -> Self {
+    pub fn new(
+        logger: Logger,
+        graphql_runner: Arc<Q>,
+        store: Arc<S>,
+        link_resolver: Arc<R>,
+        subgraph_store: Arc<St>,
+    ) -> Self {
         let explorer = Arc::new(Explorer::new(store.clone()));
 
         IndexNodeService {
@@ -55,6 +67,8 @@ where
             graphql_runner,
             store,
             explorer,
+            link_resolver,
+            subgraph_store,
         }
     }
 
@@ -90,7 +104,6 @@ where
         request_body: Body,
     ) -> Result<Response<Body>, GraphQLServerError> {
         let store = self.store.clone();
-        let graphql_runner = self.graphql_runner.clone();
 
         // Obtain the schema for the index node GraphQL API
         let schema = SCHEMA.clone();
@@ -105,21 +118,25 @@ where
             Err(e) => return Ok(QueryResults::from(QueryResult::from(e)).as_http_response()),
         };
 
-        let graphql_runner = graphql_runner.clone();
-        let load_manager = graphql_runner.load_manager();
+        let load_manager = self.graphql_runner.load_manager();
 
         // Run the query using the index node resolver
         let query_clone = query.cheap_clone();
         let logger = self.logger.cheap_clone();
         let result = {
             let options = QueryExecutionOptions {
-                resolver: IndexNodeResolver::new(&logger, graphql_runner, store),
+                resolver: IndexNodeResolver::new(
+                    &logger,
+                    store,
+                    self.link_resolver.clone(),
+                    self.subgraph_store.clone(),
+                ),
                 deadline: None,
                 max_first: std::u32::MAX,
                 max_skip: std::u32::MAX,
                 load_manager,
             };
-            let result = execute_query(query_clone.cheap_clone(), None, None, options, false).await;
+            let result = execute_query(query_clone.cheap_clone(), None, None, options).await;
             query_clone.log_execution(0);
             QueryResult::from(
                 // Index status queries are not cacheable, so we may unwrap this.
@@ -209,10 +226,12 @@ where
     }
 }
 
-impl<Q, S> Service<Request<Body>> for IndexNodeService<Q, S>
+impl<Q, S, R, St> Service<Request<Body>> for IndexNodeService<Q, S, R, St>
 where
     Q: GraphQlRunner,
     S: StatusStore,
+    R: LinkResolver,
+    St: SubgraphStore,
 {
     type Response = Response<Body>;
     type Error = GraphQLServerError;

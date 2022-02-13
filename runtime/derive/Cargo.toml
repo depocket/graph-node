@@ -1,6 +1,6 @@
 [package]
 name = "graph-runtime-derive"
-version = "0.22.0"
+version = "0.25.0"
 edition = "2018"
 
 [lib]
@@ -9,3 +9,4 @@ proc-macro = true
 [dependencies]
 syn = { version = "1.0", features = ["full"] }
 quote = "1.0"
+anyhow = "1.0"

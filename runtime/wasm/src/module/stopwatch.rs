@@ -9,7 +9,7 @@ pub struct TimeoutStopwatch {
     /// The time the stopwatch was started last, if ever.
     start_time: Option<Instant>,
     /// The time elapsed while the stopwatch was running (between start() and stop()).
-    elapsed: Duration,
+    pub elapsed: Duration,
 }
 
 impl Default for TimeoutStopwatch {
@@ -25,14 +25,14 @@ impl TimeoutStopwatch {
     /// Returns a new stopwatch.
     pub fn new() -> TimeoutStopwatch {
         let sw: TimeoutStopwatch = Default::default();
-        return sw;
+        sw
     }
 
     /// Returns a new stopwatch which will immediately be started.
     pub fn start_new() -> TimeoutStopwatch {
         let mut sw = TimeoutStopwatch::new();
         sw.start();
-        return sw;
+        sw
     }
 
     /// Starts the stopwatch.
@@ -50,13 +50,9 @@ impl TimeoutStopwatch {
     pub fn elapsed(&self) -> Duration {
         match self.start_time {
             // stopwatch is running
-            Some(t1) => {
-                return t1.elapsed() + self.elapsed;
-            }
+            Some(t1) => t1.elapsed() + self.elapsed,
             // stopwatch is not running
-            None => {
-                return self.elapsed;
-            }
+            None => self.elapsed,
         }
     }
 }

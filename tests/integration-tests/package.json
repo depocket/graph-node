@@ -1,7 +1,7 @@
 {
   "private": true,
   "workspaces": [
-    "arweave-and-3box",
+    "api-version-v0-0-4",
     "data-source-context",
     "data-source-revert",
     "fatal-error",
@@ -9,6 +9,7 @@
     "host-exports",
     "non-fatal-errors",
     "overloaded-contract-functions",
+    "poi-for-failed-subgraph",
     "remove-then-update",
     "value-roundtrip"
   ]

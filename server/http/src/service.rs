@@ -57,13 +57,13 @@ impl GraphQLServiceMetrics {
     pub fn observe_query_execution_time(&self, duration: f64, deployment_id: String) {
         self.query_execution_time
             .with_label_values(vec![deployment_id.as_ref()].as_slice())
-            .observe(duration.clone());
+            .observe(duration);
     }
 
     pub fn observe_failed_query_execution_time(&self, duration: f64, deployment_id: String) {
         self.failed_query_execution_time
             .with_label_values(vec![deployment_id.as_ref()].as_slice())
-            .observe(duration.clone());
+            .observe(duration);
     }
 }
 
@@ -209,7 +209,7 @@ where
         let query = GraphQLRequest::new(body).compat().await;
 
         let result = match query {
-            Ok(query) => service.graphql_runner.run_query(query, target, false).await,
+            Ok(query) => service.graphql_runner.run_query(query, target).await,
             Err(GraphQLServerError::QueryError(e)) => QueryResult::from(e).into(),
             Err(e) => return Err(e),
         };
@@ -387,10 +387,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use graph::data::value::Object;
     use http::status::StatusCode;
     use hyper::service::Service;
     use hyper::{Body, Method, Request};
-    use std::collections::BTreeMap;
 
     use graph::data::{
         graphql::effort::LoadManager,
@@ -421,21 +421,15 @@ mod tests {
             _max_depth: Option<u8>,
             _max_first: Option<u32>,
             _max_skip: Option<u32>,
-            _nested_resolver: bool,
         ) -> QueryResults {
             unimplemented!();
         }
 
-        async fn run_query(
-            self: Arc<Self>,
-            _query: Query,
-            _target: QueryTarget,
-            _: bool,
-        ) -> QueryResults {
-            QueryResults::from(BTreeMap::from_iter(
+        async fn run_query(self: Arc<Self>, _query: Query, _target: QueryTarget) -> QueryResults {
+            QueryResults::from(Object::from_iter(
                 vec![(
                     String::from("name"),
-                    q::Value::String(String::from("Jordi")),
+                    r::Value::String(String::from("Jordi")),
                 )]
                 .into_iter(),
             ))
@@ -486,7 +480,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn posting_valid_queries_yields_result_response() {
         let logger = Logger::root(slog::Discard, o!());
         let metrics_registry = Arc::new(MockMetricsRegistry::new());

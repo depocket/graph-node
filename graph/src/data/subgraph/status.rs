@@ -1,8 +1,9 @@
 //! Support for the indexing status API
 
 use super::schema::{SubgraphError, SubgraphHealth};
+use crate::components::store::DeploymentId;
 use crate::data::graphql::{object, IntoValue};
-use crate::prelude::{q, web3::types::H256, BlockPtr, Value};
+use crate::prelude::{r, web3::types::H256, BlockPtr, Value};
 
 pub enum Filter {
     /// Get all versions for the named subgraph
@@ -10,8 +11,10 @@ pub enum Filter {
     /// Get the current (`true`) or pending (`false`) version of the named
     /// subgraph
     SubgraphVersion(String, bool),
-    /// Get the status of all deployments whose ids are given
+    /// Get the status of all deployments whose the given given IPFS hashes
     Deployments(Vec<String>),
+    /// Get the status of all deployments with the given ids
+    DeploymentIds(Vec<DeploymentId>),
 }
 
 /// Light wrapper around `EthereumBlockPointer` that is compatible with GraphQL values.
@@ -33,7 +36,7 @@ impl EthereumBlock {
 }
 
 impl IntoValue for EthereumBlock {
-    fn into_value(self) -> q::Value {
+    fn into_value(self) -> r::Value {
         object! {
             __typename: "EthereumBlock",
             hash: self.0.hash_hex(),
@@ -64,7 +67,7 @@ pub struct ChainInfo {
 }
 
 impl IntoValue for ChainInfo {
-    fn into_value(self) -> q::Value {
+    fn into_value(self) -> r::Value {
         let ChainInfo {
             network,
             chain_head_block,
@@ -85,7 +88,9 @@ impl IntoValue for ChainInfo {
 
 #[derive(Debug)]
 pub struct Info {
-    /// The subgraph ID.
+    pub id: DeploymentId,
+
+    /// The deployment hash
     pub subgraph: String,
 
     /// Whether or not the subgraph has synced all the way to the current chain head.
@@ -104,8 +109,9 @@ pub struct Info {
 }
 
 impl IntoValue for Info {
-    fn into_value(self) -> q::Value {
+    fn into_value(self) -> r::Value {
         let Info {
+            id: _,
             subgraph,
             chains,
             entity_count,
@@ -116,7 +122,7 @@ impl IntoValue for Info {
             synced,
         } = self;
 
-        fn subgraph_error_to_value(subgraph_error: SubgraphError) -> q::Value {
+        fn subgraph_error_to_value(subgraph_error: SubgraphError) -> r::Value {
             let SubgraphError {
                 subgraph_id,
                 message,
@@ -133,23 +139,23 @@ impl IntoValue for Info {
                 block: object! {
                     __typename: "Block",
                     number: block_ptr.as_ref().map(|x| x.number),
-                    hash: block_ptr.map(|x| q::Value::from(Value::Bytes(x.hash.into()))),
+                    hash: block_ptr.map(|x| r::Value::from(Value::Bytes(x.hash.into()))),
                 },
                 deterministic: deterministic,
             }
         }
 
-        let non_fatal_errors: Vec<q::Value> = non_fatal_errors
+        let non_fatal_errors: Vec<_> = non_fatal_errors
             .into_iter()
             .map(subgraph_error_to_value)
             .collect();
-        let fatal_error_val = fatal_error.map_or(q::Value::Null, subgraph_error_to_value);
+        let fatal_error_val = fatal_error.map_or(r::Value::Null, subgraph_error_to_value);
 
         object! {
             __typename: "SubgraphIndexingStatus",
             subgraph: subgraph,
             synced: synced,
-            health: q::Value::from(health),
+            health: r::Value::from(health),
             fatalError: fatal_error_val,
             nonFatalErrors: non_fatal_errors,
             chains: chains.into_iter().map(|chain| chain.into_value()).collect::<Vec<_>>(),

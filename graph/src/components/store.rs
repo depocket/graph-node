@@ -2,24 +2,23 @@ use futures::stream::poll_fn;
 use futures::{Async, Poll, Stream};
 use graphql_parser::schema as s;
 use lazy_static::lazy_static;
-use mockall::predicate::*;
-use mockall::*;
 use serde::{Deserialize, Serialize};
 use stable_hash::prelude::*;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fmt;
+use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    fmt::Display,
-};
+use std::time::Duration;
 use thiserror::Error;
 use web3::types::{Address, H256};
 
-use crate::blockchain::Blockchain;
+use crate::blockchain::{Block, Blockchain};
+use crate::components::server::index_node::VersionInfo;
+use crate::components::transaction_receipt;
 use crate::data::subgraph::status;
 use crate::data::{store::*, subgraph::Source};
 use crate::prelude::*;
@@ -28,8 +27,6 @@ use crate::{
     blockchain::DataSource,
     data::{query::QueryTarget, subgraph::schema::*},
 };
-
-use crate::components::server::index_node::VersionInfo;
 
 lazy_static! {
     pub static ref SUBSCRIPTION_THROTTLE_INTERVAL: Duration =
@@ -40,6 +37,14 @@ lazy_static! {
             )))
             .map(Duration::from_millis)
             .unwrap_or_else(|| Duration::from_millis(1000));
+
+    /// Size limit of the entity LFU cache, in bytes.
+    // Multiplied by 1000 because the env var is in KB.
+    pub static ref ENTITY_CACHE_SIZE: usize = 1000
+        * std::env::var("GRAPH_ENTITY_CACHE_SIZE")
+            .unwrap_or("10000".into())
+            .parse::<usize>()
+            .expect("invalid GRAPH_ENTITY_CACHE_SIZE");
 }
 
 /// The type name of an entity. This is the string that is used in the
@@ -61,6 +66,10 @@ impl EntityType {
 
     pub fn into_string(self) -> String {
         self.0
+    }
+
+    pub fn is_poi(&self) -> bool {
+        &self.0 == "Poi$"
     }
 }
 
@@ -314,6 +323,7 @@ pub struct EntityWindow {
     pub ids: Vec<String>,
     /// How to get the parent id
     pub link: EntityLink,
+    pub column_names: AttributeNames,
 }
 
 /// The base collections from which we are going to get entities for use in
@@ -324,7 +334,7 @@ pub struct EntityWindow {
 #[derive(Clone, Debug, PartialEq)]
 pub enum EntityCollection {
     /// Use all entities of the given types
-    All(Vec<EntityType>),
+    All(Vec<(EntityType, AttributeNames)>),
     /// Use entities according to the windows. The set of entities that we
     /// apply order and range to is formed by taking all entities matching
     /// the window, and grouping them by the attribute of the window. Entities
@@ -334,6 +344,31 @@ pub enum EntityCollection {
     /// column `b`; they will be grouped by using `A.a` and `B.b` as the keys
     Window(Vec<EntityWindow>),
 }
+
+impl EntityCollection {
+    pub fn entity_types_and_column_names(&self) -> BTreeMap<EntityType, AttributeNames> {
+        let mut map = BTreeMap::new();
+        match self {
+            EntityCollection::All(pairs) => pairs.iter().for_each(|(entity_type, column_names)| {
+                map.insert(entity_type.clone(), column_names.clone());
+            }),
+            EntityCollection::Window(windows) => windows.iter().for_each(
+                |EntityWindow {
+                     child_type,
+                     column_names,
+                     ..
+                 }| match map.entry(child_type.clone()) {
+                    Entry::Occupied(mut entry) => entry.get_mut().extend(column_names.clone()),
+                    Entry::Vacant(entry) => {
+                        entry.insert(column_names.clone());
+                    }
+                },
+            ),
+        }
+        map
+    }
+}
+
 /// The type we use for block numbers. This has to be a signed integer type
 /// since Postgres does not support unsigned integer types. But 2G ought to
 /// be enough for everybody
@@ -441,7 +476,10 @@ impl EntityQuery {
                             }
                         };
                         self.filter = Some(filter.and_maybe(self.filter));
-                        self.collection = EntityCollection::All(vec![window.child_type.to_owned()]);
+                        self.collection = EntityCollection::All(vec![(
+                            window.child_type.to_owned(),
+                            window.column_names.clone(),
+                        )]);
                     }
                 }
             }
@@ -559,6 +597,12 @@ impl StoreEvent {
         self.changes.extend(other.changes);
         self
     }
+
+    pub fn matches(&self, filters: &BTreeSet<SubscriptionFilter>) -> bool {
+        self.changes
+            .iter()
+            .any(|change| filters.iter().any(|filter| filter.matches(change)))
+    }
 }
 
 impl fmt::Display for StoreEvent {
@@ -589,6 +633,8 @@ pub struct StoreEventStream<S> {
 pub type StoreEventStreamBox =
     StoreEventStream<Box<dyn Stream<Item = Arc<StoreEvent>, Error = ()> + Send>>;
 
+pub type UnitStream = Box<dyn futures03::Stream<Item = ()> + Unpin + Send + Sync>;
+
 impl<S> Stream for StoreEventStream<S>
 where
     S: Stream<Item = Arc<StoreEvent>, Error = ()> + Send,
@@ -613,13 +659,8 @@ where
     /// Filter a `StoreEventStream` by subgraph and entity. Only events that have
     /// at least one change to one of the given (subgraph, entity) combinations
     /// will be delivered by the filtered stream.
-    pub fn filter_by_entities(self, filters: Vec<SubscriptionFilter>) -> StoreEventStreamBox {
-        let source = self.source.filter(move |event| {
-            event
-                .changes
-                .iter()
-                .any(|change| filters.iter().any(|filter| filter.matches(change)))
-        });
+    pub fn filter_by_entities(self, filters: BTreeSet<SubscriptionFilter>) -> StoreEventStreamBox {
+        let source = self.source.filter(move |event| event.matches(&filters));
 
         StoreEventStream::new(Box::new(source))
     }
@@ -632,31 +673,23 @@ where
     /// on the returned stream as a single `StoreEvent`; the events are
     /// combined by using the maximum of all sources and the concatenation
     /// of the changes of the `StoreEvents` received during the interval.
-    pub fn throttle_while_syncing(
+    //
+    // Currently unused, needs to be made compatible with `subscribe_no_payload`.
+    pub async fn throttle_while_syncing(
         self,
         logger: &Logger,
         store: Arc<dyn QueryStore>,
         interval: Duration,
     ) -> StoreEventStreamBox {
-        // We refresh the synced flag every SYNC_REFRESH_FREQ*interval to
-        // avoid hitting the database too often to see if the subgraph has
-        // been synced in the meantime. The only downside of this approach is
-        // that we might continue throttling subscription updates for a little
-        // bit longer than we really should
-        static SYNC_REFRESH_FREQ: u32 = 4;
-
-        // Check whether a deployment is marked as synced in the store
-        let mut synced = store.is_deployment_synced().unwrap_or(false);
-        let synced_check_interval = interval.checked_mul(SYNC_REFRESH_FREQ).unwrap();
-        let mut synced_last_refreshed = Instant::now();
+        // Check whether a deployment is marked as synced in the store. Note that in the moment a
+        // subgraph becomes synced any existing subscriptions will continue to be throttled since
+        // this is not re-checked.
+        let synced = store.is_deployment_synced().await.unwrap_or(false);
 
         let mut pending_event: Option<StoreEvent> = None;
         let mut source = self.source.fuse();
         let mut had_err = false;
-        let mut delay = tokio::time::delay_for(interval)
-            .unit_error()
-            .boxed()
-            .compat();
+        let mut delay = tokio::time::sleep(interval).unit_error().boxed().compat();
         let logger = logger.clone();
 
         let source = Box::new(poll_fn(move || -> Poll<Option<Arc<StoreEvent>>, ()> {
@@ -665,11 +698,6 @@ where
                 // event first. Indicate the error now
                 had_err = false;
                 return Err(());
-            }
-
-            if !synced && synced_last_refreshed.elapsed() > synced_check_interval {
-                synced = store.is_deployment_synced().unwrap_or(false);
-                synced_last_refreshed = Instant::now();
             }
 
             if synced {
@@ -683,10 +711,7 @@ where
                 // Timer errors are harmless. Treat them as if the timer had
                 // become ready.
                 Ok(Async::Ready(())) | Err(_) => {
-                    delay = tokio::time::delay_for(interval)
-                        .unit_error()
-                        .boxed()
-                        .compat();
+                    delay = tokio::time::sleep(interval).unit_error().boxed().compat();
                     true
                 }
             };
@@ -696,14 +721,14 @@ where
                 match source.poll() {
                     Ok(Async::NotReady) => {
                         if should_send && pending_event.is_some() {
-                            let event = pending_event.take().map(|event| Arc::new(event));
+                            let event = pending_event.take().map(Arc::new);
                             return Ok(Async::Ready(event));
                         } else {
                             return Ok(Async::NotReady);
                         }
                     }
                     Ok(Async::Ready(None)) => {
-                        let event = pending_event.take().map(|event| Arc::new(event));
+                        let event = pending_event.take().map(Arc::new);
                         return Ok(Async::Ready(event));
                     }
                     Ok(Async::Ready(Some(event))) => {
@@ -714,7 +739,7 @@ where
                         // We will report the error the next time poll() is called
                         if pending_event.is_some() {
                             had_err = true;
-                            let event = pending_event.take().map(|event| Arc::new(event));
+                            let event = pending_event.take().map(Arc::new);
                             return Ok(Async::Ready(event));
                         } else {
                             return Err(());
@@ -775,6 +800,10 @@ pub enum StoreError {
     FulltextSearchNonDeterministic,
     #[error("operation was canceled")]
     Canceled,
+    #[error("database unavailable")]
+    DatabaseUnavailable,
+    #[error("subgraph forking failed: {0}")]
+    ForkFailure(String),
 }
 
 // Convenience to report a constraint violation
@@ -818,6 +847,12 @@ impl From<QueryExecutionError> for StoreError {
     }
 }
 
+impl From<std::fmt::Error> for StoreError {
+    fn from(e: std::fmt::Error) -> Self {
+        StoreError::Unknown(anyhow!("{}", e.to_string()))
+    }
+}
+
 pub struct StoredDynamicDataSource {
     pub name: String,
     pub source: Source,
@@ -829,7 +864,10 @@ pub trait SubscriptionManager: Send + Sync + 'static {
     /// Subscribe to changes for specific subgraphs and entities.
     ///
     /// Returns a stream of store events that match the input arguments.
-    fn subscribe(&self, entities: Vec<SubscriptionFilter>) -> StoreEventStreamBox;
+    fn subscribe(&self, entities: BTreeSet<SubscriptionFilter>) -> StoreEventStreamBox;
+
+    /// If the payload is not required, use for a more efficient subscription mechanism backed by a watcher.
+    fn subscribe_no_payload(&self, entities: BTreeSet<SubscriptionFilter>) -> UnitStream;
 }
 
 /// An internal identifer for the specific instance of a deployment. The
@@ -886,17 +924,29 @@ impl Display for DeploymentLocator {
     }
 }
 
+/// Subgraph forking is the process of lazily fetching entities
+/// from another subgraph's store (usually a remote one).
+pub trait SubgraphFork: Send + Sync + 'static {
+    fn fetch(&self, entity_type: String, id: String) -> Result<Option<Entity>, StoreError>;
+}
+
+/// A special trait to handle looking up ENS names from special rainbow
+/// tables that need to be manually loaded into the system
+pub trait EnsLookup: Send + Sync + 'static {
+    /// Find the reverse of keccak256 for `hash` through looking it up in the
+    /// rainbow table.
+    fn find_name(&self, hash: &str) -> Result<Option<String>, StoreError>;
+}
+
 /// Common trait for store implementations.
 #[async_trait]
 pub trait SubgraphStore: Send + Sync + 'static {
-    /// Find the reverse of keccak256 for `hash` through looking it up in the
-    /// rainbow table.
-    fn find_ens_name(&self, _hash: &str) -> Result<Option<String>, QueryExecutionError>;
+    fn ens_lookup(&self) -> Arc<dyn EnsLookup>;
 
     /// Check if the store is accepting queries for the specified subgraph.
     /// May return true even if the specified subgraph is not currently assigned to an indexing
     /// node, as the store will still accept queries.
-    fn is_deployed(&self, id: &DeploymentHash) -> Result<bool, Error>;
+    fn is_deployed(&self, id: &DeploymentHash) -> Result<bool, StoreError>;
 
     /// Create a new deployment for the subgraph `name`. If the deployment
     /// already exists (as identified by the `schema.id`), reuse that, otherwise
@@ -945,11 +995,22 @@ pub trait SubgraphStore: Send + Sync + 'static {
     /// adding a root query type etc. to it
     fn api_schema(&self, subgraph_id: &DeploymentHash) -> Result<Arc<ApiSchema>, StoreError>;
 
-    /// Return a `WritableStore` that is used for indexing subgraphs. Only
-    /// code that is part of indexing a subgraph should ever use this.
-    fn writable(
+    /// Return a `SubgraphFork`, derived from the user's `debug-fork` deployment argument,
+    /// that is used for debugging purposes only.
+    fn debug_fork(
         &self,
-        deployment: &DeploymentLocator,
+        subgraph_id: &DeploymentHash,
+        logger: Logger,
+    ) -> Result<Option<Arc<dyn SubgraphFork>>, StoreError>;
+
+    /// Return a `WritableStore` that is used for indexing subgraphs. Only
+    /// code that is part of indexing a subgraph should ever use this. The
+    /// `logger` will be used to log important messages related to the
+    /// subgraph
+    async fn writable(
+        self: Arc<Self>,
+        logger: Logger,
+        deployment: DeploymentId,
     ) -> Result<Arc<dyn WritableStore>, StoreError>;
 
     /// The network indexer does not follow the normal flow of how subgraphs
@@ -958,6 +1019,7 @@ pub trait SubgraphStore: Send + Sync + 'static {
     /// `writable` should be used instead
     fn writable_for_network_indexer(
         &self,
+        logger: Logger,
         id: &DeploymentHash,
     ) -> Result<Arc<dyn WritableStore>, StoreError>;
 
@@ -965,16 +1027,24 @@ pub trait SubgraphStore: Send + Sync + 'static {
     /// that we would use to query or copy from; in particular, this will
     /// ignore any instances of this deployment that are in the process of
     /// being set up
-    fn least_block_ptr(&self, id: &DeploymentHash) -> Result<Option<BlockPtr>, Error>;
+    fn least_block_ptr(&self, id: &DeploymentHash) -> Result<Option<BlockPtr>, StoreError>;
 
     /// Find the deployment locators for the subgraph with the given hash
     fn locators(&self, hash: &str) -> Result<Vec<DeploymentLocator>, StoreError>;
 }
 
+/// A view of the store for indexing. All indexing-related operations need
+/// to go through this trait. Methods in this trait will never return a
+/// `StoreError::DatabaseUnavailable`. Instead, they will retry the
+/// operation indefinitely until it succeeds.
 #[async_trait]
 pub trait WritableStore: Send + Sync + 'static {
     /// Get a pointer to the most recently processed block in the subgraph.
-    fn block_ptr(&self) -> Result<Option<BlockPtr>, Error>;
+    fn block_ptr(&self) -> Option<BlockPtr>;
+
+    /// Returns the Firehose `cursor` this deployment is currently at in the block stream of events. This
+    /// is used when re-connecting a Firehose stream to start back exactly where we left off.
+    fn block_cursor(&self) -> Option<String>;
 
     /// Start an existing subgraph deployment.
     fn start_subgraph_deployment(&self, logger: &Logger) -> Result<(), StoreError>;
@@ -983,26 +1053,40 @@ pub trait WritableStore: Send + Sync + 'static {
     /// subgraph block pointer to `block_ptr_to`.
     ///
     /// `block_ptr_to` must point to the parent block of the subgraph block pointer.
-    fn revert_block_operations(&self, block_ptr_to: BlockPtr) -> Result<(), StoreError>;
+    fn revert_block_operations(
+        &self,
+        block_ptr_to: BlockPtr,
+        firehose_cursor: Option<&str>,
+    ) -> Result<(), StoreError>;
 
-    /// Remove the fatal error from a subgraph and check if it is healthy or unhealthy.
-    fn unfail(&self) -> Result<(), StoreError>;
+    /// If a deterministic error happened, this function reverts the block operations from the
+    /// current block to the previous block.
+    fn unfail_deterministic_error(
+        &self,
+        current_ptr: &BlockPtr,
+        parent_ptr: &BlockPtr,
+    ) -> Result<(), StoreError>;
+
+    /// If a non-deterministic error happened and the current deployment head is past the error
+    /// block range, this function unfails the subgraph and deletes the error.
+    fn unfail_non_deterministic_error(&self, current_ptr: &BlockPtr) -> Result<(), StoreError>;
 
     /// Set subgraph status to failed with the given error as the cause.
     async fn fail_subgraph(&self, error: SubgraphError) -> Result<(), StoreError>;
 
-    fn supports_proof_of_indexing<'a>(self: Arc<Self>) -> DynTryFuture<'a, bool>;
+    async fn supports_proof_of_indexing(&self) -> Result<bool, StoreError>;
 
     /// Looks up an entity using the given store key at the latest block.
-    fn get(&self, key: EntityKey) -> Result<Option<Entity>, QueryExecutionError>;
+    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError>;
 
     /// Transact the entity changes from a single block atomically into the store, and update the
-    /// subgraph block pointer to `block_ptr_to`.
+    /// subgraph block pointer to `block_ptr_to`, and update the firehose cursor to `firehose_cursor`
     ///
     /// `block_ptr_to` must point to a child block of the current subgraph block pointer.
     fn transact_block_operations(
         &self,
         block_ptr_to: BlockPtr,
+        firehose_cursor: Option<String>,
         mods: Vec<EntityModification>,
         stopwatch: StopwatchMetrics,
         data_sources: Vec<StoredDynamicDataSource>,
@@ -1019,16 +1103,24 @@ pub trait WritableStore: Send + Sync + 'static {
     /// The deployment `id` finished syncing, mark it as synced in the database
     /// and promote it to the current version in the subgraphs where it was the
     /// pending version so far
-    fn deployment_synced(&self) -> Result<(), Error>;
+    fn deployment_synced(&self) -> Result<(), StoreError>;
 
     /// Return true if the deployment with the given id is fully synced,
     /// and return false otherwise. Errors from the store are passed back up
-    fn is_deployment_synced(&self) -> Result<bool, Error>;
+    async fn is_deployment_synced(&self) -> Result<bool, StoreError>;
 
     fn unassign_subgraph(&self) -> Result<(), StoreError>;
 
     /// Load the dynamic data sources for the given deployment
     async fn load_dynamic_data_sources(&self) -> Result<Vec<StoredDynamicDataSource>, StoreError>;
+
+    /// Report the name of the shard in which the subgraph is stored. This
+    /// should only be used for reporting and monitoring
+    fn shard(&self) -> &str;
+
+    async fn health(&self, id: &DeploymentHash) -> Result<SubgraphHealth, StoreError>;
+
+    fn input_schema(&self) -> Arc<Schema>;
 }
 
 #[async_trait]
@@ -1049,159 +1141,9 @@ pub trait QueryStoreManager: Send + Sync + 'static {
     ) -> Result<Arc<dyn QueryStore + Send + Sync>, QueryExecutionError>;
 }
 
-mock! {
-    pub Store {
-        fn get_many_mock<'a>(
-            &self,
-            _ids_for_type: BTreeMap<&'a EntityType, Vec<&'a str>>,
-        ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError>;
-    }
-}
-
 // The type that the connection pool uses to track wait times for
 // connection checkouts
 pub type PoolWaitStats = Arc<RwLock<MovingStats>>;
-
-// The store trait must be implemented manually because mockall does not support async_trait, nor borrowing from arguments.
-#[async_trait]
-impl SubgraphStore for MockStore {
-    fn find_ens_name(&self, _hash: &str) -> Result<Option<String>, QueryExecutionError> {
-        unimplemented!()
-    }
-
-    fn create_subgraph_deployment(
-        &self,
-        _: SubgraphName,
-        _: &Schema,
-        _: SubgraphDeploymentEntity,
-        _: NodeId,
-        _: String,
-        _: SubgraphVersionSwitchingMode,
-    ) -> Result<DeploymentLocator, StoreError> {
-        unimplemented!()
-    }
-
-    fn create_subgraph(&self, _: SubgraphName) -> Result<String, StoreError> {
-        unimplemented!()
-    }
-
-    fn remove_subgraph(&self, _: SubgraphName) -> Result<(), StoreError> {
-        unimplemented!()
-    }
-
-    fn reassign_subgraph(&self, _: &DeploymentLocator, _: &NodeId) -> Result<(), StoreError> {
-        unimplemented!()
-    }
-
-    fn assigned_node(&self, _: &DeploymentLocator) -> Result<Option<NodeId>, StoreError> {
-        unimplemented!()
-    }
-
-    fn assignments(&self, _: &NodeId) -> Result<Vec<DeploymentLocator>, StoreError> {
-        unimplemented!()
-    }
-
-    fn subgraph_exists(&self, _: &SubgraphName) -> Result<bool, StoreError> {
-        unimplemented!()
-    }
-
-    fn input_schema(&self, _: &DeploymentHash) -> Result<Arc<Schema>, StoreError> {
-        unimplemented!()
-    }
-
-    fn api_schema(&self, _: &DeploymentHash) -> Result<Arc<ApiSchema>, StoreError> {
-        unimplemented!()
-    }
-
-    fn writable(&self, _: &DeploymentLocator) -> Result<Arc<dyn WritableStore>, StoreError> {
-        Ok(Arc::new(MockStore::new()))
-    }
-
-    fn is_deployed(&self, _: &DeploymentHash) -> Result<bool, Error> {
-        unimplemented!()
-    }
-
-    fn least_block_ptr(&self, _: &DeploymentHash) -> Result<Option<BlockPtr>, Error> {
-        unimplemented!()
-    }
-
-    fn writable_for_network_indexer(
-        &self,
-        _: &DeploymentHash,
-    ) -> Result<Arc<dyn WritableStore>, StoreError> {
-        unimplemented!()
-    }
-
-    fn locators(&self, _: &str) -> Result<Vec<DeploymentLocator>, StoreError> {
-        unimplemented!()
-    }
-}
-
-// The store trait must be implemented manually because mockall does not support async_trait, nor borrowing from arguments.
-#[async_trait]
-impl WritableStore for MockStore {
-    fn block_ptr(&self) -> Result<Option<BlockPtr>, Error> {
-        unimplemented!()
-    }
-
-    fn start_subgraph_deployment(&self, _: &Logger) -> Result<(), StoreError> {
-        unimplemented!()
-    }
-
-    fn revert_block_operations(&self, _: BlockPtr) -> Result<(), StoreError> {
-        unimplemented!()
-    }
-
-    fn unfail(&self) -> Result<(), StoreError> {
-        unimplemented!()
-    }
-
-    async fn fail_subgraph(&self, _: SubgraphError) -> Result<(), StoreError> {
-        unimplemented!()
-    }
-
-    fn supports_proof_of_indexing<'a>(self: Arc<Self>) -> DynTryFuture<'a, bool> {
-        unimplemented!()
-    }
-
-    fn get(&self, _: EntityKey) -> Result<Option<Entity>, QueryExecutionError> {
-        unimplemented!()
-    }
-
-    fn transact_block_operations(
-        &self,
-        _: BlockPtr,
-        _: Vec<EntityModification>,
-        _: StopwatchMetrics,
-        _: Vec<StoredDynamicDataSource>,
-        _: Vec<SubgraphError>,
-    ) -> Result<(), StoreError> {
-        unimplemented!()
-    }
-
-    fn get_many(
-        &self,
-        ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
-    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
-        self.get_many_mock(ids_for_type)
-    }
-
-    fn is_deployment_synced(&self) -> Result<bool, Error> {
-        unimplemented!()
-    }
-
-    fn unassign_subgraph(&self) -> Result<(), StoreError> {
-        unimplemented!()
-    }
-
-    async fn load_dynamic_data_sources(&self) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
-        unimplemented!()
-    }
-
-    fn deployment_synced(&self) -> Result<(), Error> {
-        unimplemented!()
-    }
-}
 
 pub trait BlockStore: Send + Sync + 'static {
     type ChainStore: ChainStore;
@@ -1209,23 +1151,16 @@ pub trait BlockStore: Send + Sync + 'static {
     fn chain_store(&self, network: &str) -> Option<Arc<Self::ChainStore>>;
 }
 
-pub trait CallCache: Send + Sync + 'static {
-    type EthereumCallCache: EthereumCallCache;
-
-    fn ethereum_call_cache(&self, network: &str) -> Option<Arc<Self::EthereumCallCache>>;
-}
-
 /// Common trait for blockchain store implementations.
-#[automock]
 #[async_trait]
 pub trait ChainStore: Send + Sync + 'static {
     /// Get a pointer to this blockchain's genesis block.
     fn genesis_block_ptr(&self) -> Result<BlockPtr, Error>;
 
     /// Insert a block into the store (or update if they are already present).
-    async fn upsert_block(&self, block: EthereumBlock) -> Result<(), Error>;
+    async fn upsert_block(&self, block: Arc<dyn Block>) -> Result<(), Error>;
 
-    fn upsert_light_blocks(&self, blocks: Vec<LightEthereumBlock>) -> Result<(), Error>;
+    fn upsert_light_blocks(&self, blocks: &[&dyn Block]) -> Result<(), Error>;
 
     /// Try to update the head block pointer to the block with the highest block number.
     ///
@@ -1255,8 +1190,26 @@ pub trait ChainStore: Send + Sync + 'static {
     /// The head block pointer will be None on initial set up.
     fn chain_head_ptr(&self) -> Result<Option<BlockPtr>, Error>;
 
+    /// In-memory time cached version of `chain_head_ptr`.
+    fn cached_head_ptr(&self) -> Result<Option<BlockPtr>, Error>;
+
+    /// Get the current head block cursor for this chain.
+    ///
+    /// The head block cursor will be None on initial set up.
+    fn chain_head_cursor(&self) -> Result<Option<String>, Error>;
+
+    /// This method does actually three operations:
+    /// - Upserts received block into blocks table
+    /// - Update chain head block into networks table
+    /// - Update chain head cursor into networks table
+    async fn set_chain_head(
+        self: Arc<Self>,
+        block: Arc<dyn Block>,
+        cursor: String,
+    ) -> Result<(), Error>;
+
     /// Returns the blocks present in the store.
-    fn blocks(&self, hashes: Vec<H256>) -> Result<Vec<LightEthereumBlock>, Error>;
+    fn blocks(&self, hashes: &[H256]) -> Result<Vec<serde_json::Value>, Error>;
 
     /// Get the `offset`th ancestor of `block_hash`, where offset=0 means the block matching
     /// `block_hash` and offset=1 means its parent. Returns None if unable to complete due to
@@ -1267,7 +1220,7 @@ pub trait ChainStore: Send + Sync + 'static {
         &self,
         block_ptr: BlockPtr,
         offset: BlockNumber,
-    ) -> Result<Option<EthereumBlock>, Error>;
+    ) -> Result<Option<serde_json::Value>, Error>;
 
     /// Remove old blocks from the cache we maintain in the database and
     /// return a pair containing the number of the oldest block retained
@@ -1288,6 +1241,12 @@ pub trait ChainStore: Send + Sync + 'static {
 
     /// Find the block with `block_hash` and return the network name and number
     fn block_number(&self, block_hash: H256) -> Result<Option<(String, BlockNumber)>, StoreError>;
+
+    /// Tries to retrieve all transactions receipts for a given block.
+    async fn transaction_receipts_in_block(
+        &self,
+        block_ptr: &H256,
+    ) -> Result<Vec<transaction_receipt::LightTransactionReceipt>, StoreError>;
 }
 
 pub trait EthereumCallCache: Send + Sync + 'static {
@@ -1315,15 +1274,15 @@ pub trait QueryStore: Send + Sync {
     fn find_query_values(
         &self,
         query: EntityQuery,
-    ) -> Result<Vec<BTreeMap<String, q::Value>>, QueryExecutionError>;
+    ) -> Result<Vec<BTreeMap<String, r::Value>>, QueryExecutionError>;
 
-    fn is_deployment_synced(&self) -> Result<bool, Error>;
+    async fn is_deployment_synced(&self) -> Result<bool, Error>;
 
-    fn block_ptr(&self) -> Result<Option<BlockPtr>, Error>;
+    fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError>;
 
     fn block_number(&self, block_hash: H256) -> Result<Option<BlockNumber>, StoreError>;
 
-    fn wait_stats(&self) -> &PoolWaitStats;
+    fn wait_stats(&self) -> PoolWaitStats;
 
     /// If `block` is `None`, assumes the latest block.
     async fn has_non_fatal_errors(&self, block: Option<BlockNumber>) -> Result<bool, StoreError>;
@@ -1335,11 +1294,18 @@ pub trait QueryStore: Send + Sync {
     fn api_schema(&self) -> Result<Arc<ApiSchema>, QueryExecutionError>;
 
     fn network_name(&self) -> &str;
+
+    /// A permit should be acquired before starting query execution.
+    async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit;
 }
 
 /// A view of the store that can provide information about the indexing status
 /// of any subgraph and any deployment
+#[async_trait]
 pub trait StatusStore: Send + Sync + 'static {
+    /// A permit should be acquired before starting query execution.
+    async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit;
+
     fn status(&self, filter: status::Filter) -> Result<Vec<status::Info>, StoreError>;
 
     /// Support for the explorer-specific API
@@ -1354,17 +1320,24 @@ pub trait StatusStore: Send + Sync + 'static {
         subgraph_id: &str,
     ) -> Result<(Option<String>, Option<String>), StoreError>;
 
+    /// Support for the explorer-specific API. Returns a vector of (name, version) of all
+    /// subgraphs for a given deployment hash.
+    fn subgraphs_for_deployment_hash(
+        &self,
+        deployment_hash: &str,
+    ) -> Result<Vec<(String, String)>, StoreError>;
+
     /// A value of None indicates that the table is not available. Re-deploying
     /// the subgraph fixes this. It is undesirable to force everything to
     /// re-sync from scratch, so existing deployments will continue without a
     /// Proof of Indexing. Once all subgraphs have been re-deployed the Option
     /// can be removed.
-    fn get_proof_of_indexing<'a>(
-        self: Arc<Self>,
-        subgraph_id: &'a DeploymentHash,
-        indexer: &'a Option<Address>,
+    async fn get_proof_of_indexing(
+        &self,
+        subgraph_id: &DeploymentHash,
+        indexer: &Option<Address>,
         block: BlockPtr,
-    ) -> DynTryFuture<'a, Option<[u8; 32]>>;
+    ) -> Result<Option<[u8; 32]>, StoreError>;
 }
 
 /// An entity operation that can be transacted into the store; as opposed to
@@ -1529,11 +1502,11 @@ impl EntityCache {
 
     pub fn get(&mut self, key: &EntityKey) -> Result<Option<Entity>, QueryExecutionError> {
         // Get the current entity, apply any updates from `updates`, then from `handler_updates`.
-        let mut entity = self.current.get_entity(&*self.store, &key)?;
-        if let Some(op) = self.updates.get(&key).cloned() {
+        let mut entity = self.current.get_entity(&*self.store, key)?;
+        if let Some(op) = self.updates.get(key).cloned() {
             entity = op.apply_to(entity)
         }
-        if let Some(op) = self.handler_updates.get(&key).cloned() {
+        if let Some(op) = self.handler_updates.get(key).cloned() {
             entity = op.apply_to(entity)
         }
         Ok(entity)
@@ -1543,8 +1516,33 @@ impl EntityCache {
         self.entity_op(key, EntityOp::Remove);
     }
 
-    pub fn set(&mut self, key: EntityKey, entity: Entity) {
-        self.entity_op(key, EntityOp::Update(entity))
+    /// Store the `entity` under the given `key`. The `entity` may be only a
+    /// partial entity; the cache will ensure partial updates get merged
+    /// with existing data. The entity will be validated against the
+    /// subgraph schema, and any errors will result in an `Err` being
+    /// returned.
+    pub fn set(&mut self, key: EntityKey, entity: Entity) -> Result<(), anyhow::Error> {
+        let is_valid = entity
+            .validate(&self.store.input_schema().document, &key)
+            .is_ok();
+
+        self.entity_op(key.clone(), EntityOp::Update(entity));
+
+        // The updates we were given are not valid by themselves; force a
+        // lookup in the database and check again with an entity that merges
+        // the existing entity with the changes
+        if !is_valid {
+            let entity = self.get(&key)?.ok_or_else(|| {
+                anyhow!(
+                    "Failed to read entity {}[{}] back from cache",
+                    key.entity_type,
+                    key.entity_id
+                )
+            })?;
+            entity.validate(&self.store.input_schema().document, &key)?;
+        }
+
+        Ok(())
     }
 
     pub fn append(&mut self, operations: Vec<EntityOperation>) {
@@ -1570,7 +1568,6 @@ impl EntityCache {
 
     fn entity_op(&mut self, key: EntityKey, op: EntityOp) {
         use std::collections::hash_map::Entry;
-
         let updates = match self.in_handler {
             true => &mut self.handler_updates,
             false => &mut self.updates,
@@ -1677,6 +1674,8 @@ impl EntityCache {
                 mods.push(modification)
             }
         }
+        self.current.evict(*ENTITY_CACHE_SIZE);
+
         Ok(ModificationsAndCache {
             modifications: mods,
             data_sources: self.data_sources,
@@ -1692,9 +1691,9 @@ impl LfuCache<EntityKey, Option<Entity>> {
         store: &(impl WritableStore + ?Sized),
         key: &EntityKey,
     ) -> Result<Option<Entity>, QueryExecutionError> {
-        match self.get(&key) {
+        match self.get(key) {
             None => {
-                let mut entity = store.get(key.clone())?;
+                let mut entity = store.get(key)?;
                 if let Some(entity) = &mut entity {
                     // `__typename` is for queries not for mappings.
                     entity.remove("__typename");
@@ -1703,6 +1702,62 @@ impl LfuCache<EntityKey, Option<Entity>> {
                 Ok(entity)
             }
             Some(data) => Ok(data.to_owned()),
+        }
+    }
+}
+
+/// Determines which columns should be selected in a table.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum AttributeNames {
+    /// Select all columns. Equivalent to a `"SELECT *"`.
+    All,
+    /// Individual column names to be selected.
+    Select(BTreeSet<String>),
+}
+
+impl AttributeNames {
+    fn insert(&mut self, column_name: &str) {
+        match self {
+            AttributeNames::All => {
+                let mut set = BTreeSet::new();
+                set.insert(column_name.to_string());
+                *self = AttributeNames::Select(set)
+            }
+            AttributeNames::Select(set) => {
+                set.insert(column_name.to_string());
+            }
+        }
+    }
+
+    pub fn update(&mut self, field_name: &str) {
+        if Self::is_meta_field(field_name) {
+            return;
+        }
+        self.insert(&field_name)
+    }
+
+    /// Adds a attribute name. Ignores meta fields.
+    pub fn add_str(&mut self, field_name: &str) {
+        if Self::is_meta_field(field_name) {
+            return;
+        }
+        self.insert(field_name);
+    }
+
+    /// Returns `true` for meta field names, `false` otherwise.
+    fn is_meta_field(field_name: &str) -> bool {
+        field_name.starts_with("__")
+    }
+
+    pub fn extend(&mut self, other: Self) {
+        use AttributeNames::*;
+        match (self, other) {
+            (All, All) => {}
+            (self_ @ All, other @ Select(_)) => *self_ = other,
+            (Select(_), All) => {
+                unreachable!()
+            }
+            (Select(a), Select(b)) => a.extend(b),
         }
     }
 }

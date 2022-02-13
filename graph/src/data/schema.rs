@@ -1,8 +1,10 @@
+use crate::cheap_clone::CheapClone;
 use crate::components::store::{EntityType, SubgraphStore};
 use crate::data::graphql::ext::{DirectiveExt, DirectiveFinder, DocumentExt, TypeExt, ValueExt};
 use crate::data::store::ValueType;
 use crate::data::subgraph::{DeploymentHash, SubgraphName};
 use crate::prelude::{
+    lazy_static,
     q::Value,
     s::{self, Definition, InterfaceType, ObjectType, TypeDefinition, *},
 };
@@ -20,6 +22,8 @@ use std::hash::Hash;
 use std::iter::FromIterator;
 use std::str::FromStr;
 use std::sync::Arc;
+
+use super::graphql::ObjectOrInterface;
 
 pub const SCHEMA_TYPE_NAME: &str = "_Schema_";
 
@@ -53,6 +57,8 @@ pub enum SchemaValidationError {
     InterfaceFieldsMissing(String, String, Strings), // (type, interface, missing_fields)
     #[error("Field `{1}` in type `{0}` has invalid @derivedFrom: {2}")]
     InvalidDerivedFrom(String, String, String), // (type, field, reason)
+    #[error("The following type names are reserved: `{0}`")]
+    UsageOfReservedTypes(Strings),
     #[error("_Schema_ type is only for @imports and must not have any fields")]
     SchemaTypeWithFields,
     #[error("Imported subgraph name `{0}` is invalid")]
@@ -226,7 +232,7 @@ impl From<&s::Directive> for FulltextDefinition {
         let included_entity = included_entity_list.first().unwrap().as_object().unwrap();
         let included_field_values = included_entity.get("fields").unwrap().as_list().unwrap();
         let included_fields: HashSet<String> = included_field_values
-            .into_iter()
+            .iter()
             .map(|field| {
                 field
                     .as_object()
@@ -345,16 +351,24 @@ impl SchemaReference {
 
 #[derive(Debug)]
 pub struct ApiSchema {
-    pub schema: Schema,
+    schema: Schema,
 
     // Root types for the api schema.
     pub query_type: Arc<ObjectType>,
     pub subscription_type: Option<Arc<ObjectType>>,
+    object_types: HashMap<String, Arc<ObjectType>>,
 }
 
 impl ApiSchema {
-    /// `api_schema` will typically come from `fn api_schema` in the graphql crate.
-    pub fn from_api_schema(api_schema: Schema) -> Result<Self, anyhow::Error> {
+    /// `api_schema` will typically come from `fn api_schema` in the graphql
+    /// crate.
+    ///
+    /// In addition, the API schema has an introspection schema mixed into
+    /// `api_schema`. In particular, the `Query` type has fields called
+    /// `__schema` and `__type`
+    pub fn from_api_schema(mut api_schema: Schema) -> Result<Self, anyhow::Error> {
+        add_introspection_schema(&mut api_schema.document);
+
         let query_type = api_schema
             .document
             .get_root_query_type()
@@ -366,10 +380,19 @@ impl ApiSchema {
             .cloned()
             .map(Arc::new);
 
+        let object_types = HashMap::from_iter(
+            api_schema
+                .document
+                .get_object_type_definitions()
+                .into_iter()
+                .map(|obj_type| (obj_type.name.clone(), Arc::new(obj_type.clone()))),
+        );
+
         Ok(Self {
             schema: api_schema,
             query_type: Arc::new(query_type),
             subscription_type,
+            object_types,
         })
     }
 
@@ -393,6 +416,151 @@ impl ApiSchema {
     pub fn interfaces_for_type(&self, type_name: &EntityType) -> Option<&Vec<InterfaceType>> {
         self.schema.interfaces_for_type(type_name)
     }
+
+    /// Return an `Arc` around the `ObjectType` from our internal cache
+    ///
+    /// # Panics
+    /// If `obj_type` is not part of this schema, this function panics
+    pub fn object_type(&self, obj_type: &ObjectType) -> Arc<ObjectType> {
+        self.object_types
+            .get(&obj_type.name)
+            .expect("ApiSchema.object_type is only used with existing types")
+            .cheap_clone()
+    }
+
+    pub fn get_named_type(&self, name: &str) -> Option<&TypeDefinition> {
+        self.schema.document.get_named_type(name)
+    }
+
+    /// Returns true if the given type is an input type.
+    ///
+    /// Uses the algorithm outlined on
+    /// https://facebook.github.io/graphql/draft/#IsInputType().
+    pub fn is_input_type(&self, t: &s::Type) -> bool {
+        match t {
+            s::Type::NamedType(name) => {
+                let named_type = self.get_named_type(name);
+                named_type.map_or(false, |type_def| match type_def {
+                    s::TypeDefinition::Scalar(_)
+                    | s::TypeDefinition::Enum(_)
+                    | s::TypeDefinition::InputObject(_) => true,
+                    _ => false,
+                })
+            }
+            s::Type::ListType(inner) => self.is_input_type(inner),
+            s::Type::NonNullType(inner) => self.is_input_type(inner),
+        }
+    }
+
+    pub fn get_root_query_type_def(&self) -> Option<&s::TypeDefinition> {
+        self.schema
+            .document
+            .definitions
+            .iter()
+            .find_map(|d| match d {
+                s::Definition::TypeDefinition(def @ s::TypeDefinition::Object(_)) => match def {
+                    s::TypeDefinition::Object(t) if t.name == "Query" => Some(def),
+                    _ => None,
+                },
+                _ => None,
+            })
+    }
+
+    pub fn object_or_interface(&self, name: &str) -> Option<ObjectOrInterface<'_>> {
+        if name.starts_with("__") {
+            INTROSPECTION_SCHEMA.object_or_interface(name)
+        } else {
+            self.schema.document.object_or_interface(name)
+        }
+    }
+
+    /// Returns the type definition that a field type corresponds to.
+    pub fn get_type_definition_from_field<'a>(
+        &'a self,
+        field: &s::Field,
+    ) -> Option<&'a s::TypeDefinition> {
+        self.get_type_definition_from_type(&field.field_type)
+    }
+
+    /// Returns the type definition for a type.
+    pub fn get_type_definition_from_type<'a>(
+        &'a self,
+        t: &s::Type,
+    ) -> Option<&'a s::TypeDefinition> {
+        match t {
+            s::Type::NamedType(name) => self.get_named_type(name),
+            s::Type::ListType(inner) => self.get_type_definition_from_type(inner),
+            s::Type::NonNullType(inner) => self.get_type_definition_from_type(inner),
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn definitions(&self) -> impl Iterator<Item = &s::Definition<'static, String>> {
+        self.schema.document.definitions.iter()
+    }
+}
+
+lazy_static! {
+    static ref INTROSPECTION_SCHEMA: Document = {
+        let schema = include_str!("introspection.graphql");
+        parse_schema(schema).expect("the schema `introspection.graphql` is invalid")
+    };
+}
+
+fn add_introspection_schema(schema: &mut Document) {
+    fn introspection_fields() -> Vec<Field> {
+        // Generate fields for the root query fields in an introspection schema,
+        // the equivalent of the fields of the `Query` type:
+        //
+        // type Query {
+        //   __schema: __Schema!
+        //   __type(name: String!): __Type
+        // }
+
+        let type_args = vec![InputValue {
+            position: Pos::default(),
+            description: None,
+            name: "name".to_string(),
+            value_type: Type::NonNullType(Box::new(Type::NamedType("String".to_string()))),
+            default_value: None,
+            directives: vec![],
+        }];
+
+        vec![
+            Field {
+                position: Pos::default(),
+                description: None,
+                name: "__schema".to_string(),
+                arguments: vec![],
+                field_type: Type::NonNullType(Box::new(Type::NamedType("__Schema".to_string()))),
+                directives: vec![],
+            },
+            Field {
+                position: Pos::default(),
+                description: None,
+                name: "__type".to_string(),
+                arguments: type_args,
+                field_type: Type::NamedType("__Type".to_string()),
+                directives: vec![],
+            },
+        ]
+    }
+
+    schema
+        .definitions
+        .extend(INTROSPECTION_SCHEMA.definitions.iter().cloned());
+
+    let query_type = schema
+        .definitions
+        .iter_mut()
+        .filter_map(|d| match d {
+            Definition::TypeDefinition(TypeDefinition::Object(t)) if t.name == "Query" => Some(t),
+            _ => None,
+        })
+        .peekable()
+        .next()
+        .expect("no root `Query` in the schema");
+    query_type.fields.append(&mut introspection_fields());
 }
 
 /// A validated and preprocessed GraphQL schema for a subgraph.
@@ -519,7 +687,7 @@ impl Schema {
     }
 
     pub fn parse(raw: &str, id: DeploymentHash) -> Result<Self, Error> {
-        let document = graphql_parser::parse_schema(&raw)?.into_static();
+        let document = graphql_parser::parse_schema(raw)?.into_static();
 
         let (interfaces_for_type, types_for_interface) = Self::collect_interfaces(&document)?;
 
@@ -641,19 +809,25 @@ impl Schema {
         &self,
         schemas: &HashMap<SchemaReference, Arc<Schema>>,
     ) -> Result<(), Vec<SchemaValidationError>> {
-        let mut errors = vec![];
-        self.validate_schema_types()
-            .unwrap_or_else(|err| errors.push(err));
-        self.validate_derived_from()
-            .unwrap_or_else(|err| errors.push(err));
-        self.validate_schema_type_has_no_fields()
-            .unwrap_or_else(|err| errors.push(err));
-        self.validate_directives_on_schema_type()
-            .unwrap_or_else(|err| errors.push(err));
+        // Using this since std::array's .into_iter() doesn't work
+        // as expected (at least as of rustc 1.53)
+        let mut errors: Vec<SchemaValidationError> = std::array::IntoIter::new([
+            self.validate_schema_types(),
+            self.validate_derived_from(),
+            self.validate_schema_type_has_no_fields(),
+            self.validate_directives_on_schema_type(),
+            self.validate_reserved_types_usage(),
+        ])
+        .filter(Result::is_err)
+        // Safe unwrap due to the filter above
+        .map(Result::unwrap_err)
+        .collect();
+
         errors.append(&mut self.validate_fields());
         errors.append(&mut self.validate_import_directives());
         errors.append(&mut self.validate_fulltext_directives());
         errors.append(&mut self.validate_imported_types(schemas));
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -1056,6 +1230,69 @@ impl Schema {
                     errors
                 })
             })
+    }
+
+    /// Checks if the schema is using types that are reserved
+    /// by `graph-node`
+    fn validate_reserved_types_usage(&self) -> Result<(), SchemaValidationError> {
+        let document = &self.document;
+        let object_types: Vec<_> = document
+            .get_object_type_definitions()
+            .into_iter()
+            .map(|obj_type| &obj_type.name)
+            .collect();
+
+        let interface_types: Vec<_> = document
+            .get_interface_type_definitions()
+            .into_iter()
+            .map(|iface_type| &iface_type.name)
+            .collect();
+
+        // TYPE_NAME_filter types for all object and interface types
+        let mut filter_types: Vec<String> = object_types
+            .iter()
+            .chain(interface_types.iter())
+            .map(|type_name| format!("{}_filter", type_name))
+            .collect();
+
+        // TYPE_NAME_orderBy types for all object and interface types
+        let mut order_by_types: Vec<_> = object_types
+            .iter()
+            .chain(interface_types.iter())
+            .map(|type_name| format!("{}_orderBy", type_name))
+            .collect();
+
+        let mut reserved_types: Vec<String> = vec![
+            // The built-in scalar types
+            "Boolean".into(),
+            "ID".into(),
+            "Int".into(),
+            "BigDecimal".into(),
+            "String".into(),
+            "Bytes".into(),
+            "BigInt".into(),
+            // Reserved Query and Subscription types
+            "Query".into(),
+            "Subscription".into(),
+        ];
+
+        reserved_types.append(&mut filter_types);
+        reserved_types.append(&mut order_by_types);
+
+        // `reserved_types` will now only contain
+        // the reserved types that the given schema *is* using.
+        //
+        // That is, if the schema is compliant and not using any reserved
+        // types, then it'll become an empty vector
+        reserved_types.retain(|reserved_type| document.get_named_type(reserved_type).is_some());
+
+        if reserved_types.is_empty() {
+            Ok(())
+        } else {
+            Err(SchemaValidationError::UsageOfReservedTypes(Strings(
+                reserved_types,
+            )))
+        }
     }
 
     fn validate_schema_types(&self) -> Result<(), SchemaValidationError> {
@@ -1516,6 +1753,78 @@ type T @entity { id: ID! }
             "Expected imported types validation to fail because an imported type was missing in the target schema",
         ),
         _ => (),
+    }
+}
+
+#[test]
+fn test_reserved_types_validation() {
+    let reserved_types = [
+        // Built-in scalars
+        "Boolean",
+        "ID",
+        "Int",
+        "BigDecimal",
+        "String",
+        "Bytes",
+        "BigInt",
+        // Reserved keywords
+        "Query",
+        "Subscription",
+    ];
+
+    let dummy_hash = DeploymentHash::new("dummy").unwrap();
+
+    for reserved_type in reserved_types {
+        let schema = format!("type {} @entity {{ _: Boolean }}\n", reserved_type);
+
+        let schema = Schema::parse(&schema, dummy_hash.clone()).unwrap();
+
+        let errors = schema.validate(&HashMap::new()).unwrap_err();
+        for error in errors {
+            assert!(matches!(
+                error,
+                SchemaValidationError::UsageOfReservedTypes(_)
+            ))
+        }
+    }
+}
+
+#[test]
+fn test_reserved_filter_and_group_by_types_validation() {
+    const SCHEMA: &str = r#"
+    type Gravatar @entity {
+        _: Boolean
+      }
+    type Gravatar_filter @entity {
+        _: Boolean
+    }
+    type Gravatar_orderBy @entity {
+        _: Boolean
+    }
+    "#;
+
+    let dummy_hash = DeploymentHash::new("dummy").unwrap();
+
+    let schema = Schema::parse(SCHEMA, dummy_hash).unwrap();
+
+    let errors = schema.validate(&HashMap::new()).unwrap_err();
+
+    // The only problem in the schema is the usage of reserved types
+    assert_eq!(errors.len(), 1);
+
+    assert!(matches!(
+        &errors[0],
+        SchemaValidationError::UsageOfReservedTypes(Strings(_))
+    ));
+
+    // We know this will match due to the assertion above
+    match &errors[0] {
+        SchemaValidationError::UsageOfReservedTypes(Strings(reserved_types)) => {
+            let expected_types: Vec<String> =
+                vec!["Gravatar_filter".into(), "Gravatar_orderBy".into()];
+            assert_eq!(reserved_types, &expected_types);
+        }
+        _ => unreachable!(),
     }
 }
 

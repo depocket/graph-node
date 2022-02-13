@@ -36,7 +36,7 @@ impl QueryStoreTrait for QueryStore {
     fn find_query_values(
         &self,
         query: EntityQuery,
-    ) -> Result<Vec<BTreeMap<String, q::Value>>, QueryExecutionError> {
+    ) -> Result<Vec<BTreeMap<String, r::Value>>, QueryExecutionError> {
         assert_eq!(&self.site.deployment, &query.subgraph_id);
         let conn = self
             .store
@@ -47,11 +47,14 @@ impl QueryStoreTrait for QueryStore {
 
     /// Return true if the deployment with the given id is fully synced,
     /// and return false otherwise. Errors from the store are passed back up
-    fn is_deployment_synced(&self) -> Result<bool, Error> {
-        Ok(self.store.exists_and_synced(&self.site.deployment)?)
+    async fn is_deployment_synced(&self) -> Result<bool, Error> {
+        Ok(self
+            .store
+            .exists_and_synced(self.site.deployment.cheap_clone())
+            .await?)
     }
 
-    fn block_ptr(&self) -> Result<Option<BlockPtr>, Error> {
+    fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError> {
         self.store.block_ptr(&self.site)
     }
 
@@ -79,7 +82,7 @@ impl QueryStoreTrait for QueryStore {
             .transpose()
     }
 
-    fn wait_stats(&self) -> &PoolWaitStats {
+    fn wait_stats(&self) -> PoolWaitStats {
         self.store.wait_stats(self.replica_id)
     }
 
@@ -106,5 +109,9 @@ impl QueryStoreTrait for QueryStore {
 
     fn network_name(&self) -> &str {
         &self.site.network
+    }
+
+    async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.store.query_permit(self.replica_id).await
     }
 }

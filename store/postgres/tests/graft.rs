@@ -10,6 +10,7 @@ use graph::data::store::scalar;
 use graph::data::subgraph::schema::*;
 use graph::data::subgraph::*;
 use graph::prelude::*;
+use graph::semver::Version;
 use graph_store_postgres::SubgraphStore as DieselSubgraphStore;
 use web3::types::H256;
 
@@ -50,7 +51,9 @@ type User @entity {
     name: String,
     email: String,
     age: Int,
-    favorite_color: Color
+    favorite_color: Color,
+    # A column in the dst schema that does not exist in the src schema
+    added: String,
 }
 ";
 
@@ -86,30 +89,20 @@ lazy_static! {
 fn run_test<R, F>(test: F)
 where
     F: FnOnce(Arc<DieselSubgraphStore>, DeploymentLocator) -> R + Send + 'static,
-    R: IntoFuture<Item = ()> + Send + 'static,
-    R::Error: Send + Debug,
-    R::Future: Send,
+    R: std::future::Future<Output = Result<(), StoreError>> + Send + 'static,
 {
-    let store = STORE.subgraph_store();
+    run_test_sequentially(|store| async move {
+        let store = store.subgraph_store();
 
-    // Lock regardless of poisoning. This also forces sequential test execution.
-    let mut runtime = match STORE_RUNTIME.lock() {
-        Ok(guard) => guard,
-        Err(err) => err.into_inner(),
-    };
+        // Reset state before starting
+        remove_test_data(store.clone());
 
-    runtime
-        .block_on(async {
-            // Reset state before starting
-            remove_test_data(store.clone());
+        // Seed database with test data
+        let deployment = insert_test_data(store.clone());
 
-            // Seed database with test data
-            let deployment = insert_test_data(store.clone());
-
-            // Run test
-            test(store, deployment).into_future().compat().await
-        })
-        .unwrap_or_else(|e| panic!("Failed to run Store test: {:?}", e));
+        // Run test
+        test(store, deployment).await.expect("graft test succeeds");
+    })
 }
 
 /// Inserts test data into the store.
@@ -119,7 +112,7 @@ where
 fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
     let manifest = SubgraphManifest::<graph_chain_ethereum::Chain> {
         id: TEST_SUBGRAPH_ID.clone(),
-        spec_version: "1".to_owned(),
+        spec_version: Version::new(1, 0, 0),
         features: Default::default(),
         description: None,
         repository: None,
@@ -266,14 +259,14 @@ fn create_grafted_subgraph(
     test_store::create_subgraph(subgraph_id, schema, base)
 }
 
-fn check_graft(
+async fn check_graft(
     store: Arc<DieselSubgraphStore>,
     deployment: DeploymentLocator,
 ) -> Result<(), StoreError> {
     let query = EntityQuery::new(
         deployment.hash.clone(),
         BLOCK_NUMBER_MAX,
-        EntityCollection::All(vec![EntityType::from(USER)]),
+        EntityCollection::All(vec![(EntityType::from(USER), AttributeNames::All)]),
     )
     .order(EntityOrder::Descending(
         "name".to_string(),
@@ -305,13 +298,16 @@ fn check_graft(
     transact_entity_operations(&store, &deployment, BLOCKS[2].clone(), vec![op]).unwrap();
 
     store
-        .writable(&deployment)?
-        .revert_block_operations(BLOCKS[1].clone())
+        .cheap_clone()
+        .writable(LOGGER.clone(), deployment.id)
+        .await?
+        .revert_block_operations(BLOCKS[1].clone(), None)
         .expect("We can revert a block we just created");
 
     let err = store
-        .writable(&deployment)?
-        .revert_block_operations(BLOCKS[0].clone())
+        .writable(LOGGER.clone(), deployment.id)
+        .await?
+        .revert_block_operations(BLOCKS[0].clone(), None)
         .expect_err("Reverting past graft point is not allowed");
 
     assert!(err.to_string().contains("Can not revert subgraph"));
@@ -321,7 +317,7 @@ fn check_graft(
 
 #[test]
 fn graft() {
-    run_test(move |store, _| -> Result<(), StoreError> {
+    run_test(|store, _| async move {
         const SUBGRAPH: &str = "grafted";
 
         let subgraph_id = DeploymentHash::new(SUBGRAPH).unwrap();
@@ -334,7 +330,7 @@ fn graft() {
         )
         .expect("can create grafted subgraph");
 
-        check_graft(store, deployment)
+        check_graft(store, deployment).await
     })
 }
 
@@ -342,7 +338,7 @@ fn graft() {
 // two shards
 #[test]
 fn copy() {
-    run_test(move |store, src| -> Result<(), StoreError> {
+    run_test(|store, src| async move {
         let src_shard = store.shard(&src)?;
 
         let dst_shard = match all_shards()
@@ -361,11 +357,13 @@ fn copy() {
             store.copy_deployment(&src, dst_shard, NODE_ID.clone(), BLOCKS[1].clone())?;
 
         store
-            .writable(&deployment)?
+            .cheap_clone()
+            .writable(LOGGER.clone(), deployment.id)
+            .await?
             .start_subgraph_deployment(&*LOGGER)?;
 
         store.activate(&deployment)?;
 
-        check_graft(store, deployment)
+        check_graft(store, deployment).await
     })
 }

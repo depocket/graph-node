@@ -1,8 +1,22 @@
+// For git_testament_macros
+#![allow(unused_macros)]
+
 //! Queries to support the index node API
+use crate::primary::Site;
+use crate::{
+    deployment::{
+        get_fatal_error_id, graph_node_versions, subgraph_deployment, subgraph_error,
+        subgraph_manifest, SubgraphHealth as HealthType,
+    },
+    primary::DeploymentId,
+};
 use diesel::pg::PgConnection;
 use diesel::prelude::{
     ExpressionMethods, JoinOnDsl, NullableExpressionMethods, QueryDsl, RunQueryDsl,
 };
+use diesel::OptionalExtension;
+use diesel_derives::Associations;
+use git_testament::{git_testament, git_testament_macros};
 use graph::{
     constraint_violation,
     data::subgraph::schema::{SubgraphError, SubgraphManifestEntity},
@@ -15,13 +29,13 @@ use graph::{data::subgraph::status, prelude::web3::types::H256};
 use std::convert::TryFrom;
 use std::{ops::Bound, sync::Arc};
 
-use crate::primary::Site;
-use crate::{
-    deployment::{
-        subgraph_deployment, subgraph_error, subgraph_manifest, SubgraphHealth as HealthType,
-    },
-    primary::DeploymentId,
-};
+git_testament_macros!(version);
+git_testament!(TESTAMENT);
+
+const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CARGO_PKG_VERSION_MAJOR: &str = env!("CARGO_PKG_VERSION_MAJOR");
+const CARGO_PKG_VERSION_MINOR: &str = env!("CARGO_PKG_VERSION_MINOR");
+const CARGO_PKG_VERSION_PATCH: &str = env!("CARGO_PKG_VERSION_PATCH");
 
 type Bytes = Vec<u8>;
 
@@ -48,9 +62,11 @@ pub struct DeploymentDetail {
     graft_base: Option<String>,
     graft_block_hash: Option<Bytes>,
     graft_block_number: Option<BigDecimal>,
+    debug_fork: Option<String>,
     reorg_count: i32,
     current_reorg_depth: i32,
     max_reorg_depth: i32,
+    firehose_cursor: Option<String>,
 }
 
 #[derive(Queryable, QueryableByName)]
@@ -58,15 +74,37 @@ pub struct DeploymentDetail {
 // We map all fields to make loading `Detail` with diesel easier, but we
 // don't need all the fields
 #[allow(dead_code)]
-struct ErrorDetail {
+pub(crate) struct ErrorDetail {
     vid: i64,
-    id: String,
+    pub id: String,
     subgraph_id: String,
     message: String,
-    block_hash: Option<Bytes>,
+    pub block_hash: Option<Bytes>,
     handler: Option<String>,
-    deterministic: bool,
-    block_range: (Bound<i32>, Bound<i32>),
+    pub deterministic: bool,
+    pub block_range: (Bound<i32>, Bound<i32>),
+}
+
+fn error(conn: &PgConnection, error_id: &str) -> Result<Option<ErrorDetail>, StoreError> {
+    use subgraph_error as e;
+    e::table
+        .filter(e::id.eq(error_id))
+        .get_result(conn)
+        .optional()
+        .map_err(StoreError::from)
+}
+
+pub(crate) fn fatal_error(
+    conn: &PgConnection,
+    deployment_id: &DeploymentHash,
+) -> Result<Option<ErrorDetail>, StoreError> {
+    let fatal_error_id = match get_fatal_error_id(conn, deployment_id)? {
+        Some(fatal_error_id) => fatal_error_id,
+        // No fatal error found.
+        None => return Ok(None),
+    };
+
+    error(conn, &fatal_error_id)
 }
 
 struct DetailAndError<'a>(DeploymentDetail, Option<ErrorDetail>, &'a Vec<Arc<Site>>);
@@ -147,6 +185,7 @@ impl<'a> TryFrom<DetailAndError<'a>> for status::Info {
         let DetailAndError(detail, error, sites) = detail_and_error;
 
         let DeploymentDetail {
+            id,
             deployment,
             failed: _,
             health,
@@ -200,6 +239,7 @@ impl<'a> TryFrom<DetailAndError<'a>> for status::Info {
         let fatal_error = error.map(|e| SubgraphError::try_from(e)).transpose()?;
         // 'node' needs to be filled in later from a different shard
         Ok(status::Info {
+            id: id.into(),
             subgraph: deployment,
             synced,
             health,
@@ -246,14 +286,11 @@ pub(crate) fn deployment_statuses(
             .map(|(detail, error)| status::Info::try_from(DetailAndError(detail, error, sites)))
             .collect()
     } else {
-        let ids: Vec<_> = sites
-            .into_iter()
-            .map(|site| site.deployment.to_string())
-            .collect();
+        let ids: Vec<_> = sites.into_iter().map(|site| site.id).collect();
 
         d::table
             .left_outer_join(e::table.on(d::fatal_error.eq(e::id.nullable())))
-            .filter(d::deployment.eq_any(&ids))
+            .filter(d::id.eq_any(&ids))
             .load::<(DeploymentDetail, Option<ErrorDetail>)>(conn)?
             .into_iter()
             .map(|(detail, error)| status::Info::try_from(DetailAndError(detail, error, sites)))
@@ -261,8 +298,9 @@ pub(crate) fn deployment_statuses(
     }
 }
 
-#[derive(Queryable, QueryableByName)]
+#[derive(Queryable, QueryableByName, Identifiable, Associations)]
 #[table_name = "subgraph_manifest"]
+#[belongs_to(GraphNodeVersion)]
 // We never read the id field but map it to make the interaction with Diesel
 // simpler
 #[allow(dead_code)]
@@ -273,6 +311,7 @@ struct StoredSubgraphManifest {
     repository: Option<String>,
     features: Vec<String>,
     schema: String,
+    graph_node_version_id: Option<i32>,
 }
 
 impl From<StoredSubgraphManifest> for SubgraphManifestEntity {
@@ -325,6 +364,12 @@ impl TryFrom<StoredDeploymentEntity> for SubgraphDeploymentEntity {
             .transpose()
             .map_err(|b| constraint_violation!("invalid graft base `{}`", b))?;
 
+        let debug_fork = detail
+            .debug_fork
+            .map(|b| DeploymentHash::new(b))
+            .transpose()
+            .map_err(|b| constraint_violation!("invalid debug fork `{}`", b))?;
+
         Ok(SubgraphDeploymentEntity {
             manifest,
             failed: detail.failed,
@@ -336,6 +381,7 @@ impl TryFrom<StoredDeploymentEntity> for SubgraphDeploymentEntity {
             latest_block,
             graft_base,
             graft_block,
+            debug_fork,
             reorg_count: detail.reorg_count,
             current_reorg_depth: detail.current_reorg_depth,
             max_reorg_depth: detail.max_reorg_depth,
@@ -359,4 +405,62 @@ pub fn deployment_entity(
         .first::<crate::detail::DeploymentDetail>(conn)?;
 
     SubgraphDeploymentEntity::try_from(StoredDeploymentEntity(detail, manifest))
+}
+
+#[derive(Queryable, Identifiable, Insertable)]
+#[table_name = "graph_node_versions"]
+pub struct GraphNodeVersion {
+    pub id: i32,
+    pub git_commit_hash: String,
+    pub git_repository_dirty: bool,
+    pub crate_version: String,
+    pub major: i32,
+    pub minor: i32,
+    pub patch: i32,
+}
+
+impl GraphNodeVersion {
+    pub(crate) fn create_or_get(conn: &PgConnection) -> anyhow::Result<i32> {
+        let git_commit_hash = version_commit_hash!();
+        let git_repository_dirty = !&TESTAMENT.modifications.is_empty();
+        let crate_version = CARGO_PKG_VERSION;
+        let major: i32 = CARGO_PKG_VERSION_MAJOR
+            .parse()
+            .expect("failed to parse cargo major package version");
+        let minor: i32 = CARGO_PKG_VERSION_MINOR
+            .parse()
+            .expect("failed to parse cargo major package version");
+        let patch: i32 = CARGO_PKG_VERSION_PATCH
+            .parse()
+            .expect("failed to parse cargo major package version");
+
+        let graph_node_version_id = {
+            use graph_node_versions::dsl as g;
+
+            // try to insert our current values
+            diesel::insert_into(g::graph_node_versions)
+                .values((
+                    g::git_commit_hash.eq(&git_commit_hash),
+                    g::git_repository_dirty.eq(git_repository_dirty),
+                    g::crate_version.eq(&crate_version),
+                    g::major.eq(&major),
+                    g::minor.eq(&minor),
+                    g::patch.eq(&patch),
+                ))
+                .on_conflict_do_nothing()
+                .execute(conn)?;
+
+            // select the id for the row we just inserted
+            g::graph_node_versions
+                .select(g::id)
+                .filter(g::git_commit_hash.eq(&git_commit_hash))
+                .filter(g::git_repository_dirty.eq(git_repository_dirty))
+                .filter(g::crate_version.eq(&crate_version))
+                .filter(g::major.eq(&major))
+                .filter(g::minor.eq(&minor))
+                .filter(g::patch.eq(&patch))
+                .get_result(conn)?
+        };
+        Ok(graph_node_version_id)
+    }
 }

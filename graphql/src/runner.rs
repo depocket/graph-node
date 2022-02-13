@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -6,6 +7,8 @@ use std::time::{Duration, Instant};
 use crate::prelude::{QueryExecutionOptions, StoreResolver, SubscriptionExecutionOptions};
 use crate::query::execute_query;
 use crate::subscription::execute_prepared_subscription;
+use graph::prelude::MetricsRegistry;
+use graph::prometheus::{Gauge, Histogram};
 use graph::{
     components::store::SubscriptionManager,
     prelude::{
@@ -21,12 +24,59 @@ use graph::{
 
 use lazy_static::lazy_static;
 
+pub struct ResultSizeMetrics {
+    histogram: Box<Histogram>,
+    max_gauge: Box<Gauge>,
+}
+
+impl ResultSizeMetrics {
+    fn new(registry: Arc<impl MetricsRegistry>) -> Self {
+        // Divide the Histogram into exponentially sized buckets between 1k and 4G
+        let bins = (10..32).map(|n| 2u64.pow(n) as f64).collect::<Vec<_>>();
+        let histogram = registry
+            .new_histogram(
+                "query_result_size",
+                "the size of the result of successful GraphQL queries (in CacheWeight)",
+                bins,
+            )
+            .unwrap();
+
+        let max_gauge = registry
+            .new_gauge(
+                "query_result_max",
+                "the maximum size of a query result (in CacheWeight)",
+                HashMap::new(),
+            )
+            .unwrap();
+
+        Self {
+            histogram,
+            max_gauge,
+        }
+    }
+
+    // Tests need to construct one of these, but normal code doesn't
+    #[cfg(debug_assertions)]
+    pub fn make(registry: Arc<impl MetricsRegistry>) -> Self {
+        Self::new(registry)
+    }
+
+    pub fn observe(&self, size: usize) {
+        let size = size as f64;
+        self.histogram.observe(size);
+        if self.max_gauge.get() < size {
+            self.max_gauge.set(size);
+        }
+    }
+}
+
 /// GraphQL runner implementation for The Graph.
 pub struct GraphQlRunner<S, SM> {
     logger: Logger,
     store: Arc<S>,
     subscription_manager: Arc<SM>,
     load_manager: Arc<LoadManager>,
+    result_size: Arc<ResultSizeMetrics>,
 }
 
 lazy_static! {
@@ -81,13 +131,16 @@ where
         store: Arc<S>,
         subscription_manager: Arc<SM>,
         load_manager: Arc<LoadManager>,
+        registry: Arc<impl MetricsRegistry>,
     ) -> Self {
         let logger = logger.new(o!("component" => "GraphQlRunner"));
+        let result_size = Arc::new(ResultSizeMetrics::new(registry));
         GraphQlRunner {
             logger,
             store,
             subscription_manager,
             load_manager,
+            result_size,
         }
     }
 
@@ -129,7 +182,7 @@ where
         max_depth: Option<u8>,
         max_first: Option<u32>,
         max_skip: Option<u32>,
-        nested_resolver: bool,
+        result_size: Arc<ResultSizeMetrics>,
     ) -> Result<QueryResults, QueryResults> {
         // We need to use the same `QueryStore` for the entire query to ensure
         // we have a consistent view if the world, even when replicas, which
@@ -164,7 +217,7 @@ where
         )?;
         self.load_manager
             .decide(
-                store.wait_stats(),
+                &store.wait_stats(),
                 query.shape_hash,
                 query.query_text.as_ref(),
             )
@@ -182,6 +235,7 @@ where
                 bc,
                 error_policy,
                 query.schema.id().clone(),
+                result_size.cheap_clone(),
             )
             .await?;
             max_block = max_block.max(resolver.block_number());
@@ -196,7 +250,6 @@ where
                     max_skip: max_skip.unwrap_or(*GRAPHQL_MAX_SKIP),
                     load_manager: self.load_manager.clone(),
                 },
-                nested_resolver,
             )
             .await;
             result.append(query_res);
@@ -216,12 +269,7 @@ where
     S: QueryStoreManager,
     SM: SubscriptionManager,
 {
-    async fn run_query(
-        self: Arc<Self>,
-        query: Query,
-        target: QueryTarget,
-        nested_resolver: bool,
-    ) -> QueryResults {
+    async fn run_query(self: Arc<Self>, query: Query, target: QueryTarget) -> QueryResults {
         self.run_query_with_complexity(
             query,
             target,
@@ -229,7 +277,6 @@ where
             Some(*GRAPHQL_MAX_DEPTH),
             Some(*GRAPHQL_MAX_FIRST),
             Some(*GRAPHQL_MAX_SKIP),
-            nested_resolver,
         )
         .await
     }
@@ -242,7 +289,6 @@ where
         max_depth: Option<u8>,
         max_first: Option<u32>,
         max_skip: Option<u32>,
-        nested_resolver: bool,
     ) -> QueryResults {
         self.execute(
             query,
@@ -251,7 +297,7 @@ where
             max_depth,
             max_first,
             max_skip,
-            nested_resolver,
+            self.result_size.cheap_clone(),
         )
         .await
         .unwrap_or_else(|e| e)
@@ -278,7 +324,7 @@ where
         if let Err(err) = self
             .load_manager
             .decide(
-                store.wait_stats(),
+                &store.wait_stats(),
                 query.shape_hash,
                 query.query_text.as_ref(),
             )
@@ -293,12 +339,12 @@ where
                 logger: self.logger.clone(),
                 store,
                 subscription_manager: self.subscription_manager.cheap_clone(),
-                timeout: GRAPHQL_QUERY_TIMEOUT.clone(),
+                timeout: *GRAPHQL_QUERY_TIMEOUT,
                 max_complexity: *GRAPHQL_MAX_COMPLEXITY,
                 max_depth: *GRAPHQL_MAX_DEPTH,
                 max_first: *GRAPHQL_MAX_FIRST,
                 max_skip: *GRAPHQL_MAX_SKIP,
-                load_manager: self.load_manager.cheap_clone(),
+                result_size: self.result_size.clone(),
             },
         )
     }

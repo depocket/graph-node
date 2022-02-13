@@ -1,12 +1,20 @@
-use anyhow::{anyhow, ensure, Error};
-use ethabi::Contract;
-use futures03::{
-    future::{try_join, try_join3},
-    stream::FuturesOrdered,
-    TryStreamExt as _,
-};
+/// Rust representation of the GraphQL schema for a `SubgraphManifest`.
+pub mod schema;
+
+/// API version and spec version.
+pub mod api_version;
+pub use api_version::*;
+
+pub mod features;
+pub mod status;
+
+pub use features::{SubgraphFeature, SubgraphFeatureValidationError};
+
+use anyhow::ensure;
+use anyhow::{anyhow, Error};
+use futures03::{future::try_join3, stream::FuturesOrdered, TryStreamExt as _};
 use lazy_static::lazy_static;
-use semver::{Version, VersionReq};
+use semver::Version;
 use serde::de;
 use serde::ser;
 use serde_yaml;
@@ -15,24 +23,25 @@ use stable_hash::prelude::*;
 use std::{collections::BTreeSet, marker::PhantomData};
 use thiserror::Error;
 use wasmparser;
-use web3::types::{Address, H256};
+use web3::types::Address;
 
-use crate::data::schema::{Schema, SchemaImportError, SchemaValidationError};
 use crate::data::store::Entity;
-use crate::prelude::CheapClone;
+use crate::data::{
+    schema::{Schema, SchemaImportError, SchemaValidationError},
+    subgraph::features::validate_subgraph_features,
+};
+use crate::prelude::{r, CheapClone};
 use crate::{blockchain::DataSource, data::graphql::TryFromValue};
 use crate::{blockchain::DataSourceTemplate as _, data::query::QueryExecutionError};
 use crate::{
     blockchain::{Blockchain, UnresolvedDataSource as _, UnresolvedDataSourceTemplate as _},
     components::{
-        ethereum::NodeCapabilities,
         link_resolver::LinkResolver,
         store::{DeploymentLocator, StoreError, SubgraphStore},
     },
 };
 
-use crate::prelude::{impl_slog_value, q, BlockNumber, Deserialize, Serialize};
-use crate::util::ethereum::string_to_h256;
+use crate::prelude::{impl_slog_value, BlockNumber, Deserialize, Serialize};
 
 use std::fmt;
 use std::ops::Deref;
@@ -44,20 +53,7 @@ lazy_static! {
         .ok()
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    static ref MIN_SPEC_VERSION: Version = Version::new(0, 0, 2);
-
-    // Before this check was introduced, there were already subgraphs in
-    // the wild with spec version 0.0.3, due to confusion with the api
-    // version. To avoid breaking those, we accept 0.0.3 though it
-    // doesn't exist. In the future we should not use 0.0.3 as version
-    // and skip to 0.0.4 to avoid ambiguity.
-    static ref MAX_SPEC_VERSION: Version = Version::new(0, 0, 3);
 }
-
-/// Rust representation of the GraphQL schema for a `SubgraphManifest`.
-pub mod schema;
-
-pub mod status;
 
 /// Deserialize an Address (with or without '0x' prefix).
 fn deserialize_address<'de, D>(deserializer: D) -> Result<Option<Address>, D::Error>
@@ -160,7 +156,7 @@ impl<'de> de::Deserialize<'de> for DeploymentHash {
 }
 
 impl TryFromValue for DeploymentHash {
-    fn try_from_value(value: &q::Value) -> Result<Self, Error> {
+    fn try_from_value(value: &r::Value) -> Result<Self, Error> {
         Self::new(String::try_from_value(value)?)
             .map_err(|s| anyhow!("Invalid subgraph ID `{}`", s))
     }
@@ -190,9 +186,9 @@ impl SubgraphName {
         }
 
         // Parse into components and validate each
-        for part in s.split("/") {
-            // Each part must be non-empty and not too long
-            if part.is_empty() || part.len() > 32 {
+        for part in s.split('/') {
+            // Each part must be non-empty
+            if part.is_empty() {
                 return Err(());
             }
 
@@ -246,36 +242,6 @@ impl<'de> de::Deserialize<'de> for SubgraphName {
     }
 }
 
-#[test]
-fn test_subgraph_name_validation() {
-    assert!(SubgraphName::new("a").is_ok());
-    assert!(SubgraphName::new("a/a").is_ok());
-    assert!(SubgraphName::new("a-lOng-name_with_0ne-component").is_ok());
-    assert!(SubgraphName::new("a-long-name_with_one-3omponent").is_ok());
-    assert!(SubgraphName::new("a/b_c").is_ok());
-    assert!(SubgraphName::new("A/Z-Z").is_ok());
-    assert!(SubgraphName::new("a1/A-A").is_ok());
-    assert!(SubgraphName::new("aaa/a1").is_ok());
-    assert!(SubgraphName::new("1a/aaaa").is_ok());
-    assert!(SubgraphName::new("aaaa/1a").is_ok());
-    assert!(SubgraphName::new("2nena4test/lala").is_ok());
-
-    assert!(SubgraphName::new("").is_err());
-    assert!(SubgraphName::new("/a").is_err());
-    assert!(SubgraphName::new("a/").is_err());
-    assert!(SubgraphName::new("a//a").is_err());
-    assert!(SubgraphName::new("a/0").is_err());
-    assert!(SubgraphName::new("a/_").is_err());
-    assert!(SubgraphName::new("a/a_").is_err());
-    assert!(SubgraphName::new("a/_a").is_err());
-    assert!(SubgraphName::new("aaaa aaaaa").is_err());
-    assert!(SubgraphName::new("aaaa!aaaaa").is_err());
-    assert!(SubgraphName::new("aaaa+aaaaa").is_err());
-    assert!(SubgraphName::new("a/graphql").is_err());
-    assert!(SubgraphName::new("graphql/a").is_err());
-    assert!(SubgraphName::new("this-component-is-longer-than-the-length-limit").is_err());
-}
-
 /// Result of a creating a subgraph in the registar.
 #[derive(Serialize)]
 pub struct CreateSubgraphResult {
@@ -292,9 +258,7 @@ pub enum SubgraphRegistrarError {
     #[error("subgraph name not found: {0}")]
     NameNotFound(String),
     #[error("Ethereum network not supported by registrar: {0}")]
-    NetworkNotSupported(String),
-    #[error("Ethereum nodes for network {0} are missing the following capabilities: {1}")]
-    SubgraphNetworkRequirementsNotSupported(String, NodeCapabilities),
+    NetworkNotSupported(Error),
     #[error("deployment not found: {0}")]
     DeploymentNotFound(String),
     #[error("deployment assignment unchanged: {0}")]
@@ -379,8 +343,6 @@ pub enum SubgraphManifestValidationError {
     MultipleEthereumNetworks,
     #[error("subgraph must have at least one Ethereum network data source")]
     EthereumNetworkRequired,
-    #[error("subgraph data source has too many similar block handlers")]
-    DataSourceBlockHandlerLimitExceeded,
     #[error("the specified block must exist on the Ethereum network")]
     BlockNotFound(String),
     #[error("imported schema(s) are invalid: {0:?}")]
@@ -389,6 +351,12 @@ pub enum SubgraphManifestValidationError {
     SchemaValidationError(Vec<SchemaValidationError>),
     #[error("the graft base is invalid: {0}")]
     GraftBaseInvalid(String),
+    #[error("subgraph must use a single apiVersion across its data sources. Found: {}", format_versions(.0))]
+    DifferentApiVersions(BTreeSet<Version>),
+    #[error(transparent)]
+    FeatureValidationError(#[from] SubgraphFeatureValidationError),
+    #[error("data source {0} is invalid: {1}")]
+    DataSourceValidation(String, Error),
 }
 
 #[derive(Error, Debug)]
@@ -439,7 +407,7 @@ impl UnresolvedSchema {
     ) -> Result<Schema, anyhow::Error> {
         info!(logger, "Resolve schema"; "link" => &self.file.link);
 
-        let schema_bytes = resolver.cat(&logger, &self.file).await?;
+        let schema_bytes = resolver.cat(logger, &self.file).await?;
         Schema::parse(&String::from_utf8(schema_bytes)?, id)
     }
 }
@@ -456,217 +424,21 @@ pub struct Source {
     pub start_block: BlockNumber,
 }
 
-#[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
-pub struct TemplateSource {
-    pub abi: String,
-}
+pub fn calls_host_fn(runtime: &[u8], host_fn: &str) -> anyhow::Result<bool> {
+    use wasmparser::Payload;
 
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
-pub struct UnresolvedMappingABI {
-    pub name: String,
-    pub file: Link,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct MappingABI {
-    pub name: String,
-    pub contract: Contract,
-}
-
-impl UnresolvedMappingABI {
-    pub async fn resolve(
-        self,
-        resolver: &impl LinkResolver,
-        logger: &Logger,
-    ) -> Result<MappingABI, anyhow::Error> {
-        info!(
-            logger,
-            "Resolve ABI";
-            "name" => &self.name,
-            "link" => &self.file.link
-        );
-
-        let contract_bytes = resolver.cat(&logger, &self.file).await?;
-        let contract = Contract::load(&*contract_bytes)?;
-        Ok(MappingABI {
-            name: self.name,
-            contract,
-        })
-    }
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
-pub struct MappingBlockHandler {
-    pub handler: String,
-    pub filter: Option<BlockHandlerFilter>,
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum BlockHandlerFilter {
-    // Call filter will trigger on all blocks where the data source contract
-    // address has been called
-    Call,
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
-pub struct MappingCallHandler {
-    pub function: String,
-    pub handler: String,
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
-pub struct MappingEventHandler {
-    pub event: String,
-    pub topic0: Option<H256>,
-    pub handler: String,
-}
-
-impl MappingEventHandler {
-    pub fn topic0(&self) -> H256 {
-        self.topic0
-            .unwrap_or_else(|| string_to_h256(&self.event.replace("indexed ", "")))
-    }
-}
-
-#[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UnresolvedMapping {
-    pub kind: String,
-    pub api_version: String,
-    pub language: String,
-    pub entities: Vec<String>,
-    pub abis: Vec<UnresolvedMappingABI>,
-    #[serde(default)]
-    pub block_handlers: Vec<MappingBlockHandler>,
-    #[serde(default)]
-    pub call_handlers: Vec<MappingCallHandler>,
-    #[serde(default)]
-    pub event_handlers: Vec<MappingEventHandler>,
-    pub file: Link,
-}
-
-#[derive(Clone, Debug)]
-pub struct Mapping {
-    pub kind: String,
-    pub api_version: Version,
-    pub language: String,
-    pub entities: Vec<String>,
-    pub abis: Vec<Arc<MappingABI>>,
-    pub block_handlers: Vec<MappingBlockHandler>,
-    pub call_handlers: Vec<MappingCallHandler>,
-    pub event_handlers: Vec<MappingEventHandler>,
-    pub runtime: Arc<Vec<u8>>,
-    pub link: Link,
-}
-
-impl Mapping {
-    pub fn calls_host_fn(&self, host_fn: &str) -> bool {
-        use wasmparser::Payload;
-
-        let runtime = self.runtime.as_ref().as_ref();
-
-        for payload in wasmparser::Parser::new(0).parse_all(runtime) {
-            match payload.unwrap() {
-                Payload::ImportSection(s) => {
-                    for import in s {
-                        let import = import.unwrap();
-                        if import.field == Some(host_fn) {
-                            return true;
-                        }
-                    }
+    for payload in wasmparser::Parser::new(0).parse_all(runtime) {
+        if let Payload::ImportSection(s) = payload? {
+            for import in s {
+                let import = import?;
+                if import.field == Some(host_fn) {
+                    return Ok(true);
                 }
-                _ => (),
             }
         }
-
-        false
     }
 
-    fn has_call_handler(&self) -> bool {
-        !self.call_handlers.is_empty()
-    }
-
-    fn has_block_handler_with_call_filter(&self) -> bool {
-        self.block_handlers
-            .iter()
-            .any(|handler| matches!(handler.filter, Some(BlockHandlerFilter::Call)))
-    }
-
-    pub fn required_capabilities(&self) -> NodeCapabilities {
-        NodeCapabilities {
-            traces: self.has_block_handler_with_call_filter() || self.has_call_handler(),
-            archive: self.calls_host_fn("ethereum.call"),
-        }
-    }
-
-    pub fn find_abi(&self, abi_name: &str) -> Result<Arc<MappingABI>, Error> {
-        Ok(self
-            .abis
-            .iter()
-            .find(|abi| abi.name == abi_name)
-            .ok_or_else(|| anyhow!("No ABI entry with name `{}` found", abi_name))?
-            .cheap_clone())
-    }
-}
-
-impl UnresolvedMapping {
-    pub async fn resolve(
-        self,
-        resolver: &impl LinkResolver,
-        logger: &Logger,
-    ) -> Result<Mapping, anyhow::Error> {
-        let UnresolvedMapping {
-            kind,
-            api_version,
-            language,
-            entities,
-            abis,
-            block_handlers,
-            call_handlers,
-            event_handlers,
-            file: link,
-        } = self;
-
-        let api_version = Version::parse(&api_version)?;
-
-        ensure!(VersionReq::parse("<= 0.0.4").unwrap().matches(&api_version),
-            "The maximum supported mapping API version of this indexer is 0.0.4, but `{}` was found",
-            api_version
-        );
-
-        info!(logger, "Resolve mapping"; "link" => &link.link);
-
-        let (abis, runtime) = try_join(
-            // resolve each abi
-            abis.into_iter()
-                .map(|unresolved_abi| async {
-                    Result::<_, Error>::Ok(Arc::new(
-                        unresolved_abi.resolve(resolver, logger).await?,
-                    ))
-                })
-                .collect::<FuturesOrdered<_>>()
-                .try_collect::<Vec<_>>(),
-            async {
-                let module_bytes = resolver.cat(logger, &link).await?;
-                Ok(Arc::new(module_bytes))
-            },
-        )
-        .await?;
-
-        Ok(Mapping {
-            kind,
-            api_version,
-            language,
-            entities,
-            abis,
-            block_handlers: block_handlers.clone(),
-            call_handlers: call_handlers.clone(),
-            event_handlers: event_handlers.clone(),
-            runtime,
-            link,
-        })
-    }
+    Ok(false)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -712,7 +484,7 @@ impl Graft {
 #[serde(rename_all = "camelCase")]
 pub struct BaseSubgraphManifest<C, S, D, T> {
     pub id: DeploymentHash,
-    pub spec_version: String,
+    pub spec_version: Version,
     #[serde(default)]
     pub features: BTreeSet<SubgraphFeature>,
     pub description: Option<String>,
@@ -751,26 +523,26 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
     /// `/ipfs/QmUmg7BZC1YP1ca66rRtWKxpXp77WgVHrnv263JtDuvs2k`
     pub async fn resolve(
         id: DeploymentHash,
+        raw: serde_yaml::Mapping,
         resolver: Arc<impl LinkResolver>,
         logger: &Logger,
+        max_spec_version: semver::Version,
     ) -> Result<Self, SubgraphManifestResolveError> {
         Ok(Self(
-            SubgraphManifest::resolve(id, resolver.deref(), logger).await?,
+            SubgraphManifest::resolve_from_raw(id, raw, resolver.deref(), logger, max_spec_version)
+                .await?,
         ))
     }
 
+    /// Validates the subgraph manifest file.
+    ///
+    /// Graft base validation will be skipped if the parameter `validate_graft_base` is false.
     pub fn validate<S: SubgraphStore>(
         self,
         store: Arc<S>,
-    ) -> Result<
-        (SubgraphManifest<C>, Vec<SubgraphManifestValidationWarning>),
-        Vec<SubgraphManifestValidationError>,
-    > {
-        let (schemas, import_errors) = self.0.schema.resolve_schema_references(store.clone());
-        let validation_warnings = import_errors
-            .into_iter()
-            .map(SubgraphManifestValidationWarning::SchemaValidationWarning)
-            .collect();
+        validate_graft_base: bool,
+    ) -> Result<SubgraphManifest<C>, Vec<SubgraphManifestValidationError>> {
+        let (schemas, _) = self.0.schema.resolve_schema_references(store.clone());
 
         let mut errors: Vec<SubgraphManifestValidationError> = vec![];
 
@@ -779,49 +551,21 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
             errors.push(SubgraphManifestValidationError::NoDataSources);
         }
 
-        // Validate that the manifest has a `source` address in each data source
-        // which has call or block handlers
-        if self.0.data_sources.iter().any(|data_source| {
-            let no_source_address = data_source.source().address.is_none();
-            let has_call_handlers = !data_source.mapping().call_handlers.is_empty();
-            let has_block_handlers = !data_source.mapping().block_handlers.is_empty();
-
-            no_source_address && (has_call_handlers || has_block_handlers)
-        }) {
-            errors.push(SubgraphManifestValidationError::SourceAddressRequired)
-        };
-
-        // Validate that there are no more than one of each type of
-        // block_handler in each data source.
-        let has_too_many_block_handlers = self.0.data_sources.iter().any(|data_source| {
-            if data_source.mapping().block_handlers.is_empty() {
-                return false;
-            }
-
-            let mut non_filtered_block_handler_count = 0;
-            let mut call_filtered_block_handler_count = 0;
-            data_source
-                .mapping()
-                .block_handlers
-                .iter()
-                .for_each(|block_handler| {
-                    if block_handler.filter.is_none() {
-                        non_filtered_block_handler_count += 1
-                    } else {
-                        call_filtered_block_handler_count += 1
-                    }
-                });
-            non_filtered_block_handler_count > 1 || call_filtered_block_handler_count > 1
-        });
-        if has_too_many_block_handlers {
-            errors.push(SubgraphManifestValidationError::DataSourceBlockHandlerLimitExceeded)
+        for ds in &self.0.data_sources {
+            errors.extend(ds.validate().into_iter().map(|e| {
+                SubgraphManifestValidationError::DataSourceValidation(ds.name().to_owned(), e)
+            }));
         }
+
+        // For API versions newer than 0.0.5, validate that all mappings uses the same api_version
+        if let Err(different_api_versions) = self.0.unified_mapping_api_version() {
+            errors.push(different_api_versions.into());
+        };
 
         let mut networks = self
             .0
             .data_sources
             .iter()
-            .filter(|d| d.kind().eq("ethereum/contract"))
             .filter_map(|d| d.network().map(|n| n.to_string()))
             .collect::<Vec<String>>();
         networks.sort();
@@ -849,52 +593,37 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
                     "Grafting of subgraphs is currently disabled".to_owned(),
                 ));
             }
-            errors.extend(graft.validate(store));
+            if validate_graft_base {
+                errors.extend(graft.validate(store));
+            }
+        }
+
+        // Validate subgraph feature usage and declaration.
+        if self.0.spec_version >= SPEC_VERSION_0_0_4 {
+            if let Err(feature_validation_error) = validate_subgraph_features(&self.0) {
+                errors.push(feature_validation_error.into())
+            }
         }
 
         match errors.is_empty() {
-            true => Ok((self.0, validation_warnings)),
+            true => Ok(self.0),
             false => Err(errors),
         }
+    }
+
+    pub fn spec_version(&self) -> &Version {
+        &self.0.spec_version
     }
 }
 
 impl<C: Blockchain> SubgraphManifest<C> {
     /// Entry point for resolving a subgraph definition.
-    /// Right now the only supported links are of the form:
-    /// `/ipfs/QmUmg7BZC1YP1ca66rRtWKxpXp77WgVHrnv263JtDuvs2k`
-    pub async fn resolve(
-        id: DeploymentHash,
-        resolver: &impl LinkResolver,
-        logger: &Logger,
-    ) -> Result<Self, SubgraphManifestResolveError> {
-        let link = Link {
-            link: id.to_string(),
-        };
-        info!(logger, "Resolve manifest"; "link" => &link.link);
-
-        let file_bytes = resolver
-            .cat(logger, &link)
-            .await
-            .map_err(SubgraphManifestResolveError::ResolveError)?;
-
-        let file = String::from_utf8(file_bytes.to_vec())
-            .map_err(|_| SubgraphManifestResolveError::NonUtf8)?;
-        let raw: serde_yaml::Value = serde_yaml::from_str(&file)?;
-
-        let raw_mapping = match raw {
-            serde_yaml::Value::Mapping(m) => m,
-            _ => return Err(SubgraphManifestResolveError::InvalidFormat),
-        };
-
-        Self::resolve_from_raw(id, raw_mapping, resolver, logger).await
-    }
-
     pub async fn resolve_from_raw(
         id: DeploymentHash,
         mut raw: serde_yaml::Mapping,
         resolver: &impl LinkResolver,
         logger: &Logger,
+        max_spec_version: semver::Version,
     ) -> Result<Self, SubgraphManifestResolveError> {
         // Inject the IPFS hash as the ID of the subgraph into the definition.
         raw.insert(
@@ -908,7 +637,7 @@ impl<C: Blockchain> SubgraphManifest<C> {
         debug!(logger, "Features {:?}", unresolved.features);
 
         unresolved
-            .resolve(&*resolver, logger)
+            .resolve(&*resolver, logger, max_spec_version)
             .await
             .map_err(SubgraphManifestResolveError::ResolveError)
     }
@@ -917,7 +646,6 @@ impl<C: Blockchain> SubgraphManifest<C> {
         // Assume the manifest has been validated, ensuring network names are homogenous
         self.data_sources
             .iter()
-            .filter(|d| d.kind() == "ethereum/contract")
             .filter_map(|d| d.network().map(|n| n.to_string()))
             .next()
             .expect("Validated manifest does not have a network defined on any datasource")
@@ -926,40 +654,32 @@ impl<C: Blockchain> SubgraphManifest<C> {
     pub fn start_blocks(&self) -> Vec<BlockNumber> {
         self.data_sources
             .iter()
-            .map(|data_source| data_source.source().start_block)
+            .map(|data_source| data_source.start_block())
             .collect()
     }
 
-    pub fn mappings(&self) -> Vec<Mapping> {
+    pub fn api_versions(&self) -> impl Iterator<Item = semver::Version> + '_ {
         self.templates
             .iter()
-            .map(|template| template.mapping().clone())
+            .map(|template| template.api_version().clone())
             .chain(
                 self.data_sources
                     .iter()
-                    .map(|source| source.mapping().clone()),
+                    .map(|source| source.api_version().clone()),
             )
-            .collect()
     }
 
-    // Only used in tests
-    #[cfg(debug_assertions)]
-    pub fn requires_traces(&self) -> bool {
-        self.mappings().iter().any(|mapping| {
-            mapping.has_call_handler() || mapping.has_block_handler_with_call_filter()
-        })
+    pub fn runtimes(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        self.templates
+            .iter()
+            .map(|template| template.runtime())
+            .chain(self.data_sources.iter().map(|source| source.runtime()))
     }
 
-    pub fn required_ethereum_capabilities(&self) -> NodeCapabilities {
-        let mappings = self.mappings();
-        NodeCapabilities {
-            archive: mappings
-                .iter()
-                .any(|mapping| mapping.calls_host_fn("ethereum.call")),
-            traces: mappings.iter().any(|mapping| {
-                mapping.has_call_handler() || mapping.has_block_handler_with_call_filter()
-            }),
-        }
+    pub fn unified_mapping_api_version(
+        &self,
+    ) -> Result<UnifiedMappingApiVersion, DifferentMappingApiVersions> {
+        UnifiedMappingApiVersion::try_from_versions(self.api_versions())
     }
 }
 
@@ -968,6 +688,7 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
         self,
         resolver: &impl LinkResolver,
         logger: &Logger,
+        max_spec_version: semver::Version,
     ) -> Result<SubgraphManifest<C>, anyhow::Error> {
         let UnresolvedSubgraphManifest {
             id,
@@ -982,18 +703,14 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
             chain,
         } = self;
 
-        match semver::Version::parse(&spec_version) {
-            Ok(ver) if (*MIN_SPEC_VERSION <= ver && ver <= *MAX_SPEC_VERSION) => {}
-            _ => {
-                return Err(anyhow!(
-                    "This Graph Node only supports manifest spec versions between {} and {},
-                    but subgraph `{}` uses `{}`",
-                    *MIN_SPEC_VERSION,
-                    *MAX_SPEC_VERSION,
-                    id,
-                    spec_version
-                ));
-            }
+        if !(MIN_SPEC_VERSION..=max_spec_version.clone()).contains(&spec_version) {
+            return Err(anyhow!(
+                "This Graph Node only supports manifest spec versions between {} and {}, but subgraph `{}` uses `{}`",
+                MIN_SPEC_VERSION,
+                max_spec_version,
+                id,
+                spec_version
+            ));
         }
 
         let (schema, data_sources, templates) = try_join3(
@@ -1010,6 +727,17 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
                 .try_collect::<Vec<_>>(),
         )
         .await?;
+
+        for ds in &data_sources {
+            ensure!(
+                semver::VersionReq::parse(&format!("<= {}", *MAX_API_VERSION))
+                    .unwrap()
+                    .matches(&ds.api_version()),
+                "The maximum supported mapping API version of this indexer is {}, but `{}` was found",
+                *MAX_API_VERSION,
+                ds.api_version()
+            );
+        }
 
         Ok(SubgraphManifest {
             id,
@@ -1053,31 +781,6 @@ impl DeploymentState {
     }
 }
 
-#[derive(Debug, Deserialize, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(non_camel_case_types)]
-pub enum SubgraphFeature {
-    nonFatalErrors,
-}
-
-impl std::fmt::Display for SubgraphFeature {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SubgraphFeature::nonFatalErrors => write!(f, "nonFatalErrors"),
-        }
-    }
-}
-
-impl FromStr for SubgraphFeature {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "nonFatalErrors" => Ok(SubgraphFeature::nonFatalErrors),
-            _ => Err(anyhow::anyhow!("invalid subgraph feature {}", s)),
-        }
-    }
-}
-
 fn display_vector(input: &Vec<impl std::fmt::Display>) -> impl std::fmt::Display {
     let formatted_errors = input
         .iter()
@@ -1085,6 +788,36 @@ fn display_vector(input: &Vec<impl std::fmt::Display>) -> impl std::fmt::Display
         .collect::<Vec<String>>()
         .join("; ");
     format!("[{}]", formatted_errors)
+}
+
+#[test]
+fn test_subgraph_name_validation() {
+    assert!(SubgraphName::new("a").is_ok());
+    assert!(SubgraphName::new("a/a").is_ok());
+    assert!(SubgraphName::new("a-lOng-name_with_0ne-component").is_ok());
+    assert!(SubgraphName::new("a-long-name_with_one-3omponent").is_ok());
+    assert!(SubgraphName::new("a/b_c").is_ok());
+    assert!(SubgraphName::new("A/Z-Z").is_ok());
+    assert!(SubgraphName::new("a1/A-A").is_ok());
+    assert!(SubgraphName::new("aaa/a1").is_ok());
+    assert!(SubgraphName::new("1a/aaaa").is_ok());
+    assert!(SubgraphName::new("aaaa/1a").is_ok());
+    assert!(SubgraphName::new("2nena4test/lala").is_ok());
+
+    assert!(SubgraphName::new("").is_err());
+    assert!(SubgraphName::new("/a").is_err());
+    assert!(SubgraphName::new("a/").is_err());
+    assert!(SubgraphName::new("a//a").is_err());
+    assert!(SubgraphName::new("a/0").is_err());
+    assert!(SubgraphName::new("a/_").is_err());
+    assert!(SubgraphName::new("a/a_").is_err());
+    assert!(SubgraphName::new("a/_a").is_err());
+    assert!(SubgraphName::new("aaaa aaaaa").is_err());
+    assert!(SubgraphName::new("aaaa!aaaaa").is_err());
+    assert!(SubgraphName::new("aaaa+aaaaa").is_err());
+    assert!(SubgraphName::new("a/graphql").is_err());
+    assert!(SubgraphName::new("graphql/a").is_err());
+    assert!(SubgraphName::new("this-component-is-very-long-but-we-dont-care").is_ok());
 }
 
 #[test]
